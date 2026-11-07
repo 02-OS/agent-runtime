@@ -6,12 +6,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-AGENT_BIN="${REPO_ROOT}/profile/airootfs/usr/bin/02"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+AGENT_BIN="${AGENT_BIN:-${REPO_ROOT}/target/release/02}"
 
-if [[ ! -f "${AGENT_BIN}" ]]; then
-    echo "ERROR: ${AGENT_BIN} not found. Running build-agent-runtime.sh first..."
-    "${REPO_ROOT}/scripts/build-agent-runtime.sh"
+if [[ ! -x "${AGENT_BIN}" ]]; then
+    echo "ERROR: ${AGENT_BIN} not found. Building the release binary..."
+    cargo build --release --manifest-path "${REPO_ROOT}/Cargo.toml" --bin 02
 fi
 
 echo "============================================================"

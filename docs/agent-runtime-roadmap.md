@@ -139,7 +139,7 @@ Same flags (`--full`, global `--json`) and the same stdout fields (`files_update
 - A `.env` file is not a datapoint.
 - `02 index` library path still updates `files` and runs staleness (covered by the pipeline test, not a new CLI harness).
 
-`benchmarks/benchmark.sh` gains three timings after the existing eight: `02 add`, `02 cognify`, and `02 graph export --format json`. The script already builds via `scripts/build-agent-runtime.sh` when the staged binary is missing. No new benchmark dependency.
+`benchmarks/benchmark.sh` gains three timings after the existing eight: `02 add`, `02 cognify`, and `02 graph export --format json`. The script builds `target/release/02` with cargo when that binary is missing. No new benchmark dependency.
 
 Phase 1 is done only when `cargo fmt`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace` pass offline from this repository.
 

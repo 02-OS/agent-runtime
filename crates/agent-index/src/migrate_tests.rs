@@ -150,7 +150,7 @@ fn unscoped_commit_nodes_are_split_per_dataset() {
 
 #[test]
 fn architecture_doc_matches_schema() {
-    let doc = include_str!("../../../../../docs/agent-runtime-architecture.md");
+    let doc = include_str!("../../../docs/agent-runtime-architecture.md");
     assert!(doc.contains("relative_path"));
     assert!(doc.contains("graph_nodes"));
 }
