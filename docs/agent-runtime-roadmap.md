@@ -141,7 +141,7 @@ Same flags (`--full`, global `--json`) and the same stdout fields (`files_update
 
 `benchmarks/benchmark.sh` gains three timings after the existing eight: `02 add`, `02 cognify`, and `02 graph export --format json`. The script already builds via `scripts/build-agent-runtime.sh` when the staged binary is missing. No new benchmark dependency.
 
-Phase 1 is done only when `cargo fmt`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace` pass offline from `components/02-agent`.
+Phase 1 is done only when `cargo fmt`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace` pass offline from this repository.
 
 ## Deviations from the prompt
 

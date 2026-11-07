@@ -151,15 +151,25 @@ impl MemoryStore {
             });
         }
 
-        // 2. Check for Cargo workspace
-        let cargo_root = repo_info.root_path.join("components/02-agent/Cargo.toml");
+        // 2. Check for Cargo workspace. The runtime repo keeps Cargo.toml at
+        // its root. Older 02_OS trees nested it under components/02-agent.
+        let root_manifest = repo_info.root_path.join("Cargo.toml");
+        let nested_manifest = repo_info.root_path.join("components/02-agent/Cargo.toml");
+        let root_is_runtime = std::fs::read_to_string(&root_manifest)
+            .ok()
+            .is_some_and(|text| text.contains("agent-core"));
+        let (cargo_root, cargo_rel) = if root_is_runtime {
+            (root_manifest, "Cargo.toml".to_string())
+        } else {
+            (nested_manifest, "components/02-agent/Cargo.toml".to_string())
+        };
         if cargo_root.exists() {
             seeded.push(EvidenceMemory {
                 id: "mem_agent_runtime".to_string(),
-                claim: "02 Agent Runtime is implemented as a modular Rust workspace in components/02-agent/ providing native Git & SQLite repository intelligence".to_string(),
+                claim: "02 Agent Runtime is implemented as a modular Rust workspace providing native Git and SQLite repository intelligence".to_string(),
                 kind: MemoryKind::ArchitecturalFact,
                 evidence: vec![EvidenceItem {
-                    file: "components/02-agent/Cargo.toml".to_string(),
+                    file: cargo_rel,
                     symbols: vec!["agent-core".to_string(), "agent-index".to_string()],
                     commit: commit.clone(),
                     fingerprint: None,

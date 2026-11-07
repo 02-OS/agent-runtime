@@ -65,10 +65,10 @@ The **02 Agent Runtime** transforms **02_OS** into an *agent-native developer op
 
 ## 2. System Architecture & Crates
 
-The 02 Agent Runtime is built in Rust as a clean workspace located in `components/02-agent/`.
+The 02 Agent Runtime is built in Rust as this workspace.
 
 ```
-components/02-agent/
+agent-runtime/
 ├── Cargo.toml
 ├── crates/
 │   ├── agent-core/       # Types, RepoId, config, secrets, XDG paths
@@ -176,7 +176,7 @@ components/02-agent/
 
 ## 3. SQLite Storage Schema
 
-All index metadata is stored in `~/.local/share/02-agent/repos/<repo-id>/index.sqlite`. The database is schema version 2. The statements below match `components/02-agent/crates/agent-index/src/schema.rs`.
+All index metadata is stored in `~/.local/share/02-agent/repos/<repo-id>/index.sqlite`. The database is schema version 2. The statements below match `crates/agent-index/src/schema.rs`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS files (
