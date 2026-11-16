@@ -259,6 +259,18 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             StoragePaths::ensure_private_dir(parent)?;
         }
     }
+    for legacy_tmp in [
+        path.with_extension("tmp"),
+        PathBuf::from(format!("{}.tmp", path.display())),
+    ] {
+        if let Ok(meta) = fs::symlink_metadata(&legacy_tmp) {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(AgentError::Io(std::io::Error::from_raw_os_error(
+                    libc::EISDIR,
+                )));
+            }
+        }
+    }
     let dir = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
