@@ -1,0 +1,20 @@
+[package]
+name = "agent-desktop"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "02-desktop"
+path = "src/main.rs"
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+chrono.workspace = true
+clap.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

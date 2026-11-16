@@ -8,11 +8,13 @@ version = "0.1.0"
 dependencies = [
  "agent-context",
  "agent-core",
+ "agent-daemon",
  "agent-git",
  "agent-index",
  "agent-mcp",
  "agent-memory",
  "agent-parser",
+ "agent-skills",
  "chrono",
  "clap",
  "git2",
@@ -71,6 +73,7 @@ dependencies = [
  "agent-mcp",
  "agent-memory",
  "agent-parser",
+ "agent-skills",
  "chrono",
  "clap",
  "libc",
@@ -80,6 +83,18 @@ dependencies = [
  "thiserror",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "agent-desktop"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "chrono",
+ "clap",
+ "libc",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -103,6 +118,7 @@ dependencies = [
  "chrono",
  "hex",
  "ignore",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -121,12 +137,17 @@ dependencies = [
  "agent-index",
  "agent-memory",
  "agent-parser",
+ "agent-skills",
  "chrono",
  "git2",
+ "hex",
+ "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -139,9 +160,12 @@ dependencies = [
  "agent-parser",
  "chrono",
  "git2",
+ "hex",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
 ]
@@ -166,6 +190,19 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "agent-skills"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "libc",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

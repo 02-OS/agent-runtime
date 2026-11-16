@@ -17,6 +17,11 @@ sha2.workspace = true
 hex.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+libc.workspace = true
+
+[features]
+default = []
+embeddings = []
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -10,14 +10,16 @@ members = [
     "crates/agent-mcp",
     "crates/agent-daemon",
     "crates/agent-cli",
+    "crates/agent-desktop",
+    "crates/agent-skills",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["02_OS Systems Engineering Team <https://github.com/csy20/02_OS>"]
+authors = ["02_OS Systems Engineering Team <https://github.com/02-OS/agent-runtime>"]
 license = "GPL-3.0-or-later"
-repository = "https://github.com/csy20/02_OS"
+repository = "https://github.com/02-OS/agent-runtime"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

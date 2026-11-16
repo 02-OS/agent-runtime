@@ -9,9 +9,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 AGENT_BIN="${AGENT_BIN:-${REPO_ROOT}/target/release/02}"
 
+cd "${REPO_ROOT}"
+
 if [[ ! -x "${AGENT_BIN}" ]]; then
     echo "ERROR: ${AGENT_BIN} not found. Building the release binary..."
-    cargo build --release --manifest-path "${REPO_ROOT}/Cargo.toml" --bin 02
+    cargo build --release --locked --manifest-path "${REPO_ROOT}/Cargo.toml" --bin 02
 fi
 
 echo "============================================================"
@@ -19,6 +21,10 @@ echo " 02 Agent Runtime Performance Benchmarks"
 echo " Target Binary: ${AGENT_BIN}"
 echo " Repository:    ${REPO_ROOT}"
 echo "============================================================"
+
+# Initialize and warm the repository index before timing individual operations
+"${AGENT_BIN}" init >/dev/null
+"${AGENT_BIN}" index --full >/dev/null
 
 # Benchmark 1: Repository Status Latency
 echo -n "1. Repository Status Latency: "
@@ -37,33 +43,33 @@ DIFF_MS=$(( (END_NS - START_NS) / 1000000 ))
 echo "${DIFF_MS} ms"
 
 # Benchmark 3: BM25 Full-Text Search Latency
-echo -n "3. FTS5 BM25 Search Latency ('profiledef'): "
+echo -n "3. FTS5 BM25 Search Latency ('ContextCompiler'): "
 START_NS=$(date +%s%N)
-"${AGENT_BIN}" search "profiledef" --limit 10 >/dev/null
+"${AGENT_BIN}" search "ContextCompiler" --limit 10 >/dev/null
 END_NS=$(date +%s%N)
 DIFF_MS=$(( (END_NS - START_NS) / 1000000 ))
 echo "${DIFF_MS} ms"
 
 # Benchmark 4: AST Symbol Query Latency
-echo -n "4. AST Symbol Lookup Latency ('iso_name'): "
+echo -n "4. AST Symbol Lookup Latency ('IndexDatabase'): "
 START_NS=$(date +%s%N)
-"${AGENT_BIN}" symbol "iso_name" >/dev/null
+"${AGENT_BIN}" symbol "IndexDatabase" >/dev/null
 END_NS=$(date +%s%N)
 DIFF_MS=$(( (END_NS - START_NS) / 1000000 ))
 echo "${DIFF_MS} ms"
 
 # Benchmark 5: Symbol Dependency & Test Graph Traversal
-echo -n "5. Symbol Call Graph Traversal ('rotate_refresh_token'): "
+echo -n "5. Symbol Call Graph Traversal ('compile'): "
 START_NS=$(date +%s%N)
-"${AGENT_BIN}" deps "rotate_refresh_token" >/dev/null 2>&1 || true
+"${AGENT_BIN}" deps "compile" >/dev/null
 END_NS=$(date +%s%N)
 DIFF_MS=$(( (END_NS - START_NS) / 1000000 ))
 echo "${DIFF_MS} ms"
 
 # Benchmark 6: Context Compiler Pipeline & Budgeting
-echo -n "6. Context Compiler Execution ('iso name and profile configuration' --budget 4000): "
+echo -n "6. Context Compiler Execution ('compile repository context within token budget' --budget 4000): "
 START_NS=$(date +%s%N)
-"${AGENT_BIN}" context "iso name and profile configuration" --budget 4000 >/dev/null
+"${AGENT_BIN}" context "compile repository context within token budget" --budget 4000 >/dev/null
 END_NS=$(date +%s%N)
 DIFF_MS=$(( (END_NS - START_NS) / 1000000 ))
 echo "${DIFF_MS} ms"
@@ -76,7 +82,7 @@ END_NS=$(date +%s%N)
 DIFF_MS=$(( (END_NS - START_NS) / 1000000 ))
 echo "${DIFF_MS} ms"
 
-# Benchmark 8: Full Repository Re-index (400+ files, 1500+ symbols, 10000+ refs)
+# Benchmark 8: Full Repository Re-index
 echo -n "8. Full Re-index Latency (--full): "
 START_NS=$(date +%s%N)
 "${AGENT_BIN}" index --full >/dev/null

@@ -41,7 +41,18 @@ impl StoragePaths {
 
     /// Create a directory and restrict it to the owning user (`0700`).
     pub fn ensure_private_dir(path: &Path) -> Result<()> {
-        fs::create_dir_all(path)?;
+        if let Ok(meta) = fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return Err(AgentError::Security(format!(
+                    "refusing to use symlinked directory {}",
+                    path.display()
+                )));
+            }
+        }
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
@@ -68,6 +79,14 @@ impl StoragePaths {
     pub fn repo_db_path(repo_id: &RepoId) -> Result<PathBuf> {
         let dir = Self::repo_dir(repo_id)?;
         Ok(dir.join("index.sqlite"))
+    }
+
+    /// Git-anchored facts: ~/.local/share/02-agent/repos/<repo-id>/facts.sqlite
+    ///
+    /// `memories.jsonl` stays the evidence-memory record. Facts are a separate catalog.
+    pub fn repo_facts_path(repo_id: &RepoId) -> Result<PathBuf> {
+        let dir = Self::repo_dir(repo_id)?;
+        Ok(dir.join("facts.sqlite"))
     }
 
     /// Memories path: ~/.local/share/02-agent/repos/<repo-id>/memories.jsonl

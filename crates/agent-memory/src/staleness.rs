@@ -1,38 +1,33 @@
-use crate::store::MemoryStore;
+use crate::{evidence::EvidenceSnapshot, store::MemoryStore};
 use agent_core::{
     config::RepoConfig,
-    contain::read_regular_text_within,
-    types::{EvidenceMemory, Language, MemoryStatus, RepoId},
+    contain::{contains_symlink, read_regular_text_within},
+    types::{EvidenceMemory, Language, MemoryStatus, RepoId, SecretPattern},
     Result,
 };
 use agent_git::GitRepo;
+use agent_index::scanner::custom_ignored;
 use agent_index::IndexDatabase;
 use agent_parser::CodeExtractor;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::Path;
 
-fn is_code_evidence(path: &str) -> bool {
-    matches!(
-        Path::new(path).extension().and_then(|ext| ext.to_str()),
-        Some("rs" | "py" | "c" | "sh" | "js" | "ts")
-    )
+struct SymbolChanges {
+    names: HashSet<String>,
 }
 
-fn live_symbol_names(root: &Path, relative: &str, max_bytes: u64) -> Option<HashSet<String>> {
-    let path = Path::new(relative);
-    let content = read_regular_text_within(root, path, max_bytes).ok()?;
-    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-    let extracted =
-        CodeExtractor::extract(relative, &content, Language::from_extension(extension)).ok()?;
-    let mut names = HashSet::new();
-    for symbol in extracted.symbols {
-        names.insert(symbol.name);
-        names.insert(symbol.qualified_name);
+impl SymbolChanges {
+    fn new() -> Self {
+        Self {
+            names: HashSet::new(),
+        }
     }
-    Some(names)
+
+    fn insert(&mut self, _file: &str, name: &str, _qualified: &str) {
+        self.names.insert(name.to_string());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,47 +53,58 @@ impl StalenessEngine {
     ) -> Result<StalenessReport> {
         let root = repo_root.as_ref();
         let diff_hunks = git_repo.get_diff_hunks()?;
+        let config = RepoConfig::load_or_default(root);
+        let max_bytes = config.max_file_size_kb.saturating_mul(1024);
 
         let mut modified_files = Vec::new();
-        let mut changed_symbols: HashSet<String> = HashSet::new();
+        let mut changed_symbols = SymbolChanges::new();
 
         for file_diff in &diff_hunks {
             modified_files.push(file_diff.file_path.clone());
-            let full_file_path = root.join(&file_diff.file_path);
+            let relative = Path::new(&file_diff.file_path);
+            if SecretPattern::is_secret(relative)
+                || custom_ignored(relative, &config.custom_ignores)
+                || contains_symlink(root, relative)
+            {
+                continue;
+            }
 
-            if file_diff.is_deleted || !full_file_path.exists() {
+            if file_diff.is_deleted || !root.join(relative).exists() {
                 let old_syms = db.find_symbols_by_file(repo_id, &file_diff.file_path)?;
                 for s in old_syms {
-                    changed_symbols.insert(s.name);
+                    changed_symbols.insert(&file_diff.file_path, &s.name, &s.qualified_name);
                 }
                 continue;
             }
 
-            // File exists and was modified: compare indexed symbols with a fresh extract.
-            let content = match fs::read_to_string(&full_file_path) {
-                Ok(c) => c,
+            // Bounded, symlink-rejecting read. Oversized and external paths are skipped.
+            let content = match read_regular_text_within(root, relative, max_bytes) {
+                Ok(content) => content,
                 Err(_) => continue,
             };
 
-            let ext = full_file_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            let lang = agent_core::types::Language::from_extension(ext);
+            let ext = relative.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let lang = Language::from_extension(ext);
             let fresh_extraction =
                 CodeExtractor::extract(&file_diff.file_path, &content, lang).ok();
 
+            let old_symbols = db
+                .find_symbols_by_file(repo_id, &file_diff.file_path)
+                .unwrap_or_default();
+
             if let Some(ref fresh) = fresh_extraction {
-                let fresh_names: HashSet<&str> = fresh
+                let fresh_qualified: HashSet<&str> = fresh
                     .symbols
                     .iter()
-                    .map(|symbol| symbol.name.as_str())
+                    .map(|symbol| symbol.qualified_name.as_str())
                     .collect();
-                if let Ok(old_symbols) = db.find_symbols_by_file(repo_id, &file_diff.file_path) {
-                    for old in old_symbols {
-                        if !fresh_names.contains(old.name.as_str()) {
-                            changed_symbols.insert(old.name);
-                        }
+                for old in &old_symbols {
+                    if !fresh_qualified.contains(old.qualified_name.as_str()) {
+                        changed_symbols.insert(
+                            &file_diff.file_path,
+                            &old.name,
+                            &old.qualified_name,
+                        );
                     }
                 }
             }
@@ -111,17 +117,49 @@ impl StalenessEngine {
                     for sym in &fresh.symbols {
                         // Check if hunk overlaps with symbol line boundaries
                         if sym.start_line <= hunk_range_end && sym.end_line >= hunk_range_start {
-                            // Check if fingerprint changed compared to database record
-                            let existing = db.find_symbols_by_name(repo_id, &sym.name)?;
-                            let matched = existing.iter().find(|e| e.file_path == sym.file_path);
+                            // Match accurately within the same file so same-named methods (e.g. new, fmt) never collide.
+                            let matched = old_symbols
+                                .iter()
+                                .find(|e| e.id == sym.id)
+                                .or_else(|| {
+                                    old_symbols.iter().find(|e| {
+                                        e.file_path == sym.file_path
+                                            && e.qualified_name == sym.qualified_name
+                                            && e.kind == sym.kind
+                                            && e.start_line == sym.start_line
+                                    })
+                                })
+                                .or_else(|| {
+                                    old_symbols.iter().find(|e| {
+                                        e.file_path == sym.file_path
+                                            && e.qualified_name == sym.qualified_name
+                                            && e.kind == sym.kind
+                                    })
+                                })
+                                .or_else(|| {
+                                    old_symbols.iter().find(|e| {
+                                        e.file_path == sym.file_path
+                                            && e.name == sym.name
+                                            && e.kind == sym.kind
+                                            && e.start_line == sym.start_line
+                                    })
+                                });
 
                             if let Some(old) = matched {
                                 if old.fingerprint != sym.fingerprint {
-                                    changed_symbols.insert(sym.name.clone());
+                                    changed_symbols.insert(
+                                        &sym.file_path,
+                                        &sym.name,
+                                        &sym.qualified_name,
+                                    );
                                 }
                             } else {
                                 // Brand new or moved symbol
-                                changed_symbols.insert(sym.name.clone());
+                                changed_symbols.insert(
+                                    &sym.file_path,
+                                    &sym.name,
+                                    &sym.qualified_name,
+                                );
                             }
                         }
                     }
@@ -135,60 +173,83 @@ impl StalenessEngine {
         let mut fresh_count = 0;
         let mut degraded_count = 0;
         let mut stale_count = 0;
-        let max_bytes = RepoConfig::load_or_default(root).max_file_size_kb * 1024;
-        let mut live_cache: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+        let mut live_cache: HashMap<String, Option<EvidenceSnapshot>> = HashMap::new();
+        let mut commit_cache: HashMap<(String, String), Option<EvidenceSnapshot>> = HashMap::new();
 
         for mut mem in memories {
-            let mut memory_changed = false;
-            let mut has_stale_evidence = false;
-            let mut has_degraded_evidence = false;
-
-            for ev in &mem.evidence {
-                let full_path = root.join(&ev.file);
-                if !full_path.is_file() {
-                    has_stale_evidence = true;
-                    break;
-                }
-
-                if is_code_evidence(&ev.file) {
-                    let names = live_cache
-                        .entry(ev.file.clone())
-                        .or_insert_with(|| live_symbol_names(root, &ev.file, max_bytes));
-                    match names {
-                        Some(names) => {
-                            for sym in &ev.symbols {
-                                if !names.contains(sym) {
-                                    has_stale_evidence = true;
-                                } else if changed_symbols.contains(sym) {
-                                    has_degraded_evidence = true;
-                                }
-                            }
-                        }
-                        None => has_stale_evidence = true,
-                    }
-                } else {
-                    for sym in &ev.symbols {
-                        if changed_symbols.contains(sym) {
-                            has_degraded_evidence = true;
-                        }
-                    }
-                }
-            }
-
             if mem.status == MemoryStatus::Invalidated {
                 stale_count += 1;
                 continue;
             }
 
+            let mut memory_changed = false;
+            let mut has_stale_evidence = false;
+            let mut has_degraded_evidence = false;
+
+            for ev in &mut mem.evidence {
+                let relative = Path::new(&ev.file);
+                if contains_symlink(root, relative) || !root.join(relative).is_file() {
+                    has_stale_evidence = true;
+                    break;
+                }
+
+                let live = live_cache
+                    .entry(ev.file.clone())
+                    .or_insert_with(|| EvidenceSnapshot::load(root, &ev.file, max_bytes).ok());
+                match live {
+                    Some(snapshot) => {
+                        if !snapshot.symbols_exist(&ev.symbols) {
+                            has_stale_evidence = true;
+                        } else if !snapshot.matches(ev) {
+                            has_degraded_evidence = true;
+                        }
+                        if ev.fingerprint.is_none() {
+                            // Upgrade legacy evidence from its immutable cited commit, never
+                            // from the catalog that indexing may already have replaced.
+                            let recorded = commit_cache
+                                .entry((ev.file.clone(), ev.commit.clone()))
+                                .or_insert_with(|| {
+                                    git_repo
+                                        .read_text_at_commit(&ev.commit, &ev.file, max_bytes)
+                                        .ok()
+                                        .and_then(|content| {
+                                            EvidenceSnapshot::from_content(&ev.file, &content).ok()
+                                        })
+                                });
+                            if let Some(baseline) = recorded
+                                .as_ref()
+                                .and_then(|old| old.baseline(&ev.symbols).ok())
+                            {
+                                ev.fingerprint = Some(baseline);
+                                memory_changed = true;
+                                has_degraded_evidence |= !snapshot.matches(ev);
+                            } else {
+                                // Missing/unverifiable baselines require explicit verification.
+                                has_degraded_evidence = true;
+                            }
+                        }
+                    }
+                    None => has_stale_evidence = true,
+                }
+            }
+
             let old_status = mem.status;
+            let seen_updated_at = mem.updated_at;
             if has_stale_evidence {
                 mem.status = MemoryStatus::Stale;
                 mem.confidence = 0.0;
             } else if has_degraded_evidence {
-                mem.status = MemoryStatus::Degraded;
-                mem.confidence = 0.70;
+                if old_status == MemoryStatus::Stale
+                    && mem.evidence.iter().any(|item| item.fingerprint.is_none())
+                {
+                    mem.status = MemoryStatus::Stale;
+                    mem.confidence = 0.0;
+                } else {
+                    mem.status = MemoryStatus::Degraded;
+                    mem.confidence = 0.70;
+                }
             } else {
-                // No changed symbols touching this memory -> preserve fresh status!
+                // Status follows the evidence snapshot. The changed-symbol set is report-only.
                 mem.status = MemoryStatus::Fresh;
                 mem.confidence = 1.0;
             }
@@ -206,11 +267,11 @@ impl StalenessEngine {
             }
 
             if memory_changed {
-                store.save(&mem)?;
+                store.save_if_unchanged(&mem, seen_updated_at)?;
             }
         }
 
-        let mut sym_vec: Vec<String> = changed_symbols.into_iter().collect();
+        let mut sym_vec: Vec<String> = changed_symbols.names.into_iter().collect();
         sym_vec.sort();
 
         Ok(StalenessReport {

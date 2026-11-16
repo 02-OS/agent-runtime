@@ -65,7 +65,7 @@ The **02 Agent Runtime** transforms **02_OS** into an *agent-native developer op
 
 ## 2. System Architecture & Crates
 
-The 02 Agent Runtime is built in Rust as this workspace.
+The 02 Agent Runtime is built in Rust as a clean workspace in this workspace.
 
 ```
 agent-runtime/
@@ -130,20 +130,22 @@ agent-runtime/
   - `Degraded`: Code touched or surrounding context changed, confidence lowered.
   - `Stale`: Linked symbol modified or deleted, requires verification.
   - `Invalidated`: Explicitly marked obsolete.
-- **Storage**: Append-friendly JSONL stored at `~/.local/share/02-agent/repos/<repo-id>/memories.jsonl`.
+- **Storage**: Append-friendly JSONL stored at `~/.local/share/02-agent/repos/<repo-id>/memories.jsonl`. Claims are redacted both when stored and when legacy rows are read. New evidence records a versioned selected-symbol or whole-file fingerprint; legacy evidence with no fingerprint is checked against its cited commit and requires explicit verification if that commit is unavailable.
 
 ### 2.6 `agent-context`
 - **Task Intent Parsing**: Extracts identifiers, keywords, file paths, and operations from natural language prompts.
-- **Multi-Signal Relevance Scoring**:
-  1. Exact symbol name match (Score: +10.0)
-  2. Modified in working tree / git diff (Score: +8.0)
-  3. Partial / case-insensitive symbol match (Score: +5.0)
-  4. Related test suites (Score: +4.5)
-  5. Dependency / call-graph proximity (Score: +3.0)
-  6. BM25 full-text search score (Normalized 0.0 - 5.0)
-  7. Fresh architectural memories (Score: +2.5)
-  8. Recent commit activity (Score: +1.5)
-- **Token Budget Allocator**: Dynamic knapsack packing algorithm ensuring output remains strictly under the `--budget` limit (default 8,000 tokens).
+- **Multi-Signal Relevance Scoring** (these are the weights in `compiler.rs`):
+  1. Exact symbol name match: +10 on the symbol and on its file.
+  2. Partial symbol match (`search_symbols`, limit 25): +7.
+  3. Dirty working-tree path: +8 on the file, and +8 again on a symbol in that file. Secret-named paths are left out of this score and out of the published path list.
+  4. Caller file: +5.
+  5. Callee file: +4.
+  6. Test file and the scored test: +6.
+  7. Full-text rank boost: `6.0 - min(4.0, rank_index * 0.3)`, so 6.0 down to 2.0. This is the hit's position, not the SQLite `bm25()` value.
+  8. A fresh memory whose claim or evidence symbol matches: +4 on each evidence file that passes validation. The memory item itself receives no score.
+  9. The last 15 commits are copied, with author and summary redacted. They receive no score, and the copy is not filtered to files already selected.
+- **Token estimate**: UTF-8 byte length divided by 4, rounding up (`text.len().div_ceil(4)`). The reported `returned_tokens` is that estimate of the pretty-printed redacted JSON, repeated until the digits of the count stop changing the size. Hard caps before that prune are 15 files, 12 symbols, 10 dependency edges, and 8 tests.
+- **Token Budget Allocator**: Ranked evidence selection followed by bounded pruning against the final redacted JSON payload (default 8,000 estimated tokens).
 - **Dual Format Output**: Emits structured JSON (`--json`) or human/agent-readable Markdown.
 
 ### 2.7 `agent-mcp`
@@ -170,19 +172,28 @@ agent-runtime/
 - **Binary**: `02-agentd`, packaged as a systemd user service (`02-agentd.service`).
 - **IPC Transport**: Unix domain socket located at `$XDG_RUNTIME_DIR/02agent.sock` with restrictive `0600` permissions.
 - **Security Check**: Warns when started as root and keeps running. The socket is mode `0600`, storage directories are mode `0700`, and each accepted connection must present the daemon user's `SO_PEERCRED` uid.
-- **Repo Watcher**: Monitors registered repositories (`watched_repos.json`). When HEAD or the worktree fingerprint changes, it runs the same single-scan index path as `02 index` and logs sync failures.
+- **Repo Watcher**: Monitors automatically registered repositories (`watched_repos.json`), preserving explicit opt-outs. It compares HEAD, eligible file content hashes, and configuration with successful-index state, reconciles once on startup, and logs/retries sync failures. Index writers use an adjacent file lock across the complete pipeline, including memory evaluation, before publishing completion.
 
 ---
 
 ## 3. SQLite Storage Schema
 
-All index metadata is stored in `~/.local/share/02-agent/repos/<repo-id>/index.sqlite`. The database is schema version 2. The statements below match `crates/agent-index/src/schema.rs`.
+All index metadata is stored in `~/.local/share/02-agent/repos/<repo-id>/index.sqlite`. The database is schema version 5. Existing v1 through v4 catalogs upgrade in place. The `files` unique key is `(repo_id, relative_path)`. `files.raw_fingerprint` and `files.redacted_fingerprint` are present and left null by the upgrade. `symbols.redacted_fingerprint` is copied from `fingerprint`. `completed_index_state.phase` defaults to `complete`. The full-text table is recreated empty until the next index. `actors`, `tool_invocations`, `approvals`, `evidence_packages`, and `memory_index` are created by `SCHEMA_V5_SQL` in `crates/agent-index/src/schema.rs`. References without caller IDs are re-extracted on the next index or cognify run. Legacy catalogs have no completed-index marker until their next successful index. Observing a repository updates its identity without certifying its content. The statements below are the catalog tables after that upgrade. They are not the full migration script.
 
 ```sql
+CREATE TABLE IF NOT EXISTS completed_index_state (
+    repo_id TEXT PRIMARY KEY,
+    head_commit TEXT,
+    fingerprint TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT 'complete',
+    FOREIGN KEY(repo_id) REFERENCES repositories(repo_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     repo_id TEXT NOT NULL,
-    relative_path TEXT NOT NULL UNIQUE,
+    relative_path TEXT NOT NULL,
     file_hash TEXT NOT NULL,
     git_blob_id TEXT,
     size_bytes INTEGER NOT NULL,
@@ -191,6 +202,9 @@ CREATE TABLE IF NOT EXISTS files (
     is_test INTEGER NOT NULL DEFAULT 0,
     is_doc INTEGER NOT NULL DEFAULT 0,
     indexed_at TEXT NOT NULL,
+    raw_fingerprint TEXT,
+    redacted_fingerprint TEXT,
+    UNIQUE (repo_id, relative_path),
     FOREIGN KEY(repo_id) REFERENCES repositories(repo_id) ON DELETE CASCADE
 );
 
@@ -206,6 +220,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     signature TEXT,
     doc_comment TEXT,
     fingerprint TEXT NOT NULL,
+    raw_fingerprint TEXT,
+    redacted_fingerprint TEXT,
     FOREIGN KEY(repo_id) REFERENCES repositories(repo_id) ON DELETE CASCADE
 );
 
@@ -214,6 +230,7 @@ CREATE TABLE IF NOT EXISTS symbol_references (
     repo_id TEXT NOT NULL,
     source_file TEXT NOT NULL,
     source_symbol_name TEXT,
+    source_symbol_id TEXT,
     target_name TEXT NOT NULL,
     target_symbol_id TEXT,
     kind TEXT NOT NULL,
@@ -287,14 +304,18 @@ CREATE TABLE IF NOT EXISTS graph_edges (
 
 ## 5. Token Budget Allocation Algorithm
 
-The context compiler maximizes evidence density while staying strictly within the requested token budget:
+The context compiler ranks evidence and estimates tokens as UTF-8 bytes divided
+by four, rounded up. This is a deterministic estimate, rather than a tokenizer
+for a particular model. `budget.returned_tokens` counts the final pretty JSON
+payload, including metadata and the budget report itself.
 
-1. **Budget Partitioning**:
-   - Manifest & Environment Anchor: ~5% of budget.
-   - Working Tree Diffs: ~15% of budget.
-   - Top Ranked Symbols & Definitions: ~40% of budget.
-   - Call Graphs & Dependency Chains: ~15% of budget.
-   - Related Test Suites: ~15% of budget.
-   - Architectural Memories & Commits: ~10% of budget.
-2. **Greedy Knapsack Packing**: Each candidate chunk is estimated for tokens (4 characters per token heuristic). Items are packed in decreasing order of multi-signal relevance score.
-3. **Smart Truncation**: If a symbol definition or test file exceeds the remaining chunk quota, the compiler preserves the signature and docstring while collapsing the body.
+Files are selected by relevance, with bounded excerpts around matched symbols.
+The compiler then removes optional items in priority order until the entire
+serialized package fits. It uses binary search over removal counts to avoid
+serializing once for every discarded memory or symbol. It preserves complete
+JSON and evidence records.
+
+A zero budget, an oversized task, or any budget too small for the required
+metadata returns an explicit error describing the minimum estimate. Successful
+CLI JSON and MCP context payloads always fit their requested estimated budget.
+Shorten the task or increase the budget when metadata cannot fit.

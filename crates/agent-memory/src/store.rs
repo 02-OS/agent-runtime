@@ -1,9 +1,13 @@
 use agent_core::{
+    contain::write_private_atomic,
     paths::StoragePaths,
-    types::{EvidenceItem, EvidenceMemory, MemoryKind, MemoryStatus, RepoId, RepoInfo},
+    types::{
+        EvidenceItem, EvidenceMemory, MemoryKind, MemoryStatus, RepoId, RepoInfo, SecretPattern,
+    },
     AgentError, Result,
 };
 use chrono::Utc;
+use std::borrow::Cow;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -25,23 +29,51 @@ impl MemoryStore {
     }
 
     /// Load all evidence memories from memories.jsonl.
+    /// Fails closed on malformed JSONL lines instead of silently dropping records.
     pub fn load_all(&self) -> Result<Vec<EvidenceMemory>> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
+        match fs::symlink_metadata(&self.path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(AgentError::Security(format!(
+                    "refusing to read symlinked memory store {}",
+                    self.path.display()
+                )));
+            }
+            Ok(meta) if meta.file_type().is_file() => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Ok(_) => {
+                return Err(AgentError::Security(format!(
+                    "memory store {} is not a regular file",
+                    self.path.display()
+                )));
+            }
+            Err(err) => return Err(err.into()),
         }
 
-        let file = fs::File::open(&self.path)?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&self.path)?;
         let reader = BufReader::new(file);
         let mut memories = Vec::new();
 
-        for line in reader.lines() {
+        for (index, line) in reader.lines().enumerate() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(mem) = serde_json::from_str::<EvidenceMemory>(&line) {
-                memories.push(mem);
+            let mut mem: EvidenceMemory = serde_json::from_str(&line).map_err(|err| {
+                AgentError::General(format!(
+                    "malformed memory record on line {} of {}: {err}",
+                    index + 1,
+                    self.path.display()
+                ))
+            })?;
+            // Older stores may contain raw claims. Never expose those through any reader.
+            if let Cow::Owned(redacted) = SecretPattern::redact_cow(&mem.claim) {
+                mem.claim = redacted;
             }
+            memories.push(mem);
         }
 
         Ok(memories)
@@ -59,7 +91,36 @@ impl MemoryStore {
         self.save_unlocked(memory)
     }
 
+    /// Replace `memory.id` only when its stored `updated_at` is still `seen`.
+    ///
+    /// A concurrent writer that stored a newer timestamp wins. This does not
+    /// resurrect a row the caller has not loaded.
+    pub fn save_if_unchanged(
+        &self,
+        memory: &EvidenceMemory,
+        seen_updated_at: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let _lock = self.lock()?;
+        let mut memory = memory.clone();
+        memory.claim = SecretPattern::redact(&memory.claim);
+        let mut all = self.load_all()?;
+        if let Some(pos) = all.iter().position(|existing| existing.id == memory.id) {
+            if all[pos].updated_at != seen_updated_at {
+                return Err(AgentError::General(format!(
+                    "stale memory write for {} refused",
+                    memory.id
+                )));
+            }
+            all[pos] = memory;
+        } else {
+            all.push(memory);
+        }
+        self.write_all(&all)
+    }
+
     fn save_unlocked(&self, memory: &EvidenceMemory) -> Result<()> {
+        let mut memory = memory.clone();
+        memory.claim = SecretPattern::redact(&memory.claim);
         let mut all = self.load_all()?;
         if let Some(pos) = all.iter().position(|m| m.id == memory.id) {
             all[pos] = memory.clone();
@@ -90,27 +151,16 @@ impl MemoryStore {
     }
 
     fn write_all(&self, memories: &[EvidenceMemory]) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let temp_path = self.path.with_extension("jsonl.tmp");
-        {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&temp_path)?;
-
-            for mem in memories {
-                let serialized = serde_json::to_string(mem)?;
-                writeln!(file, "{}", serialized)?;
+        let mut buffer = Vec::new();
+        for mem in memories {
+            let mut sanitized = mem.clone();
+            if let Cow::Owned(redacted) = SecretPattern::redact_cow(&sanitized.claim) {
+                sanitized.claim = redacted;
             }
-            file.flush()?;
+            serde_json::to_writer(&mut buffer, &sanitized)?;
+            buffer.write_all(b"\n")?;
         }
-
-        fs::rename(temp_path, &self.path)?;
-        Ok(())
+        write_private_atomic(&self.path, &buffer)
     }
 
     /// Automatically discover foundational architectural facts if memories are currently empty.
@@ -133,9 +183,7 @@ impl MemoryStore {
         if profiledef.exists() {
             seeded.push(EvidenceMemory {
                 id: "mem_archiso_profile".to_string(),
-                claim:
-                    "02_OS is an Arch Linux live ISO distribution built via mkarchiso in profile/"
-                        .to_string(),
+                claim: "02_OS is a live image built with mkarchiso from profile/".to_string(),
                 kind: MemoryKind::ArchitecturalFact,
                 evidence: vec![EvidenceItem {
                     file: "profile/profiledef.sh".to_string(),
@@ -151,25 +199,25 @@ impl MemoryStore {
             });
         }
 
-        // 2. Check for Cargo workspace. The runtime repo keeps Cargo.toml at
-        // its root. Older 02_OS trees nested it under components/02-agent.
-        let root_manifest = repo_info.root_path.join("Cargo.toml");
-        let nested_manifest = repo_info.root_path.join("components/02-agent/Cargo.toml");
-        let root_is_runtime = std::fs::read_to_string(&root_manifest)
-            .ok()
-            .is_some_and(|text| text.contains("agent-core"));
-        let (cargo_root, cargo_rel) = if root_is_runtime {
-            (root_manifest, "Cargo.toml".to_string())
-        } else {
-            (nested_manifest, "components/02-agent/Cargo.toml".to_string())
-        };
-        if cargo_root.exists() {
+        // 2. Check for Cargo workspace. The split tree vendors the runtime.
+        let cargo_rel = [
+            "components/02-agent/Cargo.toml",
+            "vendor/agent-runtime/Cargo.toml",
+        ]
+        .into_iter()
+        .find(|rel| repo_info.root_path.join(rel).is_file());
+        if let Some(cargo_rel) = cargo_rel {
+            let cargo_dir = cargo_rel
+                .trim_end_matches("/Cargo.toml")
+                .trim_end_matches("Cargo.toml");
             seeded.push(EvidenceMemory {
                 id: "mem_agent_runtime".to_string(),
-                claim: "02 Agent Runtime is implemented as a modular Rust workspace providing native Git and SQLite repository intelligence".to_string(),
+                claim: format!(
+                    "02 Agent Runtime is implemented as a modular Rust workspace in {cargo_dir}/ providing native Git & SQLite repository intelligence"
+                ),
                 kind: MemoryKind::ArchitecturalFact,
                 evidence: vec![EvidenceItem {
-                    file: cargo_rel,
+                    file: cargo_rel.to_string(),
                     symbols: vec!["agent-core".to_string(), "agent-index".to_string()],
                     commit: commit.clone(),
                     fingerprint: None,
@@ -182,8 +230,24 @@ impl MemoryStore {
             });
         }
 
-        for mem in &seeded {
-            self.save_unlocked(mem)?;
+        for mem in &mut seeded {
+            for item in &mut mem.evidence {
+                match crate::MemoryVerifier::capture_evidence(
+                    &repo_info.root_path,
+                    &item.file,
+                    item.symbols.clone(),
+                    &item.commit,
+                ) {
+                    Ok(captured) => *item = captured,
+                    Err(_) => {
+                        mem.status = MemoryStatus::Stale;
+                        mem.confidence = 0.0;
+                    }
+                }
+            }
+        }
+        if !seeded.is_empty() {
+            self.write_all(&seeded)?;
         }
 
         Ok(seeded.len())
@@ -207,14 +271,17 @@ impl ExclusiveLock {
     fn acquire(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
+                StoragePaths::ensure_private_dir(parent)?;
             }
         }
+        use std::os::unix::fs::OpenOptionsExt;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };

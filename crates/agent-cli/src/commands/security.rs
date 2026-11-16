@@ -1,4 +1,4 @@
-use agent_core::{types::SecretPattern, Result};
+use agent_core::{contain::contains_symlink, types::SecretPattern, Result};
 use agent_git::{GitDiscovery, GitRepo};
 use ignore::WalkBuilder;
 use serde_json::json;
@@ -112,7 +112,9 @@ fn audit_repository(repo_root: &Path) -> Result<SecurityAudit> {
     builder.git_exclude(true);
     builder.follow_links(false);
     let agent_ignore = repo_root.join(".02agentignore");
-    if agent_ignore.exists() {
+    if !contains_symlink(repo_root, Path::new(".02agentignore"))
+        && fs::symlink_metadata(&agent_ignore).is_ok_and(|m| m.file_type().is_file())
+    {
         builder.add_custom_ignore_filename(".02agentignore");
     }
 

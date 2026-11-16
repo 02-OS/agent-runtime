@@ -1,6 +1,9 @@
-use crate::extractor::ExtractionResult;
+use crate::extractor::{
+    declaration_id, extract_doc_comment, qualified_name, walk_tree, ExtractionResult, WalkAction,
+};
 use agent_core::types::{ReferenceKind, Symbol, SymbolKind, SymbolReference};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use tree_sitter::{Node, Parser};
 
 pub enum Kind {
@@ -23,7 +26,10 @@ impl Kind {
     }
 }
 
-/// Parse with the grammar for `kind`. Returns `None` when the grammar yields no symbols.
+/// Parse with the grammar for `kind`.
+///
+/// Returns `None` only when tree-sitter cannot produce a tree. A valid module
+/// with references and no declarations is still a successful parse.
 pub fn extract(file_path: &str, content: &str, kind: Kind) -> Option<ExtractionResult> {
     let mut parser = Parser::new();
     let _ = parser.set_language(&kind.language());
@@ -36,11 +42,7 @@ pub fn extract(file_path: &str, content: &str, kind: Kind) -> Option<ExtractionR
         tree.root_node(),
         &mut symbols,
         &mut references,
-        None,
     );
-    if symbols.is_empty() {
-        return None;
-    }
     Some(ExtractionResult {
         symbols,
         references,
@@ -50,100 +52,142 @@ pub fn extract(file_path: &str, content: &str, kind: Kind) -> Option<ExtractionR
 fn walk(
     file_path: &str,
     content: &str,
-    node: Node,
+    root: Node,
     symbols: &mut Vec<Symbol>,
     references: &mut Vec<SymbolReference>,
-    current: Option<&str>,
 ) {
-    let mut next = current.map(str::to_string);
-    if let Some(kind) = symbol_kind(node.kind()) {
-        if let Some(name) = symbol_name(content, node) {
-            if !is_noise(name) {
-                let line = node.start_position().row + 1;
-                let owned = name.to_string();
-                let body = node_text(content, node);
-                symbols.push(Symbol {
-                    id: format!("{file_path}::{owned}::{line}"),
-                    name: owned.clone(),
-                    qualified_name: format!("{file_path}::{owned}"),
-                    kind,
-                    file_path: file_path.to_string(),
-                    start_line: line,
-                    end_line: node.end_position().row + 1,
-                    signature: Some(first_line(body).to_string()),
-                    doc_comment: None,
-                    fingerprint: fingerprint(body),
-                });
-                next = Some(owned);
-            }
-        }
-    }
+    let mut seen_tests: HashSet<(Vec<String>, String, usize)> = HashSet::new();
 
-    if node.kind() == "call_expression" {
-        if let Some(name) = call_name(content, node) {
-            if !is_noise(name) {
-                let line = node.start_position().row + 1;
-                let kind = if name == "test" || name == "group" {
-                    ReferenceKind::Tests
-                } else {
-                    ReferenceKind::Calls
-                };
-                references.push(SymbolReference {
-                    source_file: file_path.to_string(),
-                    source_symbol_name: next.clone(),
-                    target_name: name.to_string(),
-                    target_symbol_id: None,
-                    kind,
-                    line_number: line,
-                });
-                if name == "test" || name == "group" {
-                    if let Some(label) = first_quoted(node_text(content, node)) {
-                        if !symbols.iter().any(|symbol| symbol.name == label) {
+    walk_tree(root, |node, scope, cur, cur_id| {
+        let mut action = WalkAction::Same;
+        let mut active_name = cur;
+        let mut active_id = cur_id;
+        let mut declared_name: Option<String> = None;
+        let mut declared_id: Option<String> = None;
+
+        if node.kind() == "variable_declarator" {
+            if let (Some(name_node), Some(val_node)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("value"),
+            ) {
+                if matches!(
+                    val_node.kind(),
+                    "arrow_function" | "function_expression" | "function" | "generator_function"
+                ) {
+                    if let Some(name) = identifier_text(content, name_node) {
+                        if !is_noise(name) {
+                            let line = node.start_position().row + 1;
+                            let owned = name.to_string();
+                            let body = node_text(content, node);
+                            let id = declaration_id(file_path, scope, &owned, node.start_byte());
                             symbols.push(Symbol {
-                                id: format!("{file_path}::{label}::{line}"),
-                                name: label.to_string(),
-                                qualified_name: format!("{file_path}::{label}"),
+                                id: id.clone(),
+                                name: owned.clone(),
+                                qualified_name: qualified_name(file_path, scope, &owned),
                                 kind: SymbolKind::Function,
                                 file_path: file_path.to_string(),
                                 start_line: line,
-                                end_line: line,
-                                signature: Some(format!("{name}('{label}')")),
-                                doc_comment: None,
-                                fingerprint: fingerprint(label),
+                                end_line: node.end_position().row + 1,
+                                signature: Some(first_line(body).to_string()),
+                                doc_comment: extract_doc_comment(content, node, false),
+                                fingerprint: fingerprint(body),
                             });
+                            declared_name = Some(owned.clone());
+                            declared_id = Some(id.clone());
+                            action = WalkAction::EnterSymbol { name: owned, id };
+                        }
+                    }
+                }
+            }
+        } else if let Some(kind) = symbol_kind(node.kind()) {
+            if let Some(name) = symbol_name(content, node) {
+                if !is_noise(name) {
+                    let line = node.start_position().row + 1;
+                    let owned = name.to_string();
+                    let body = node_text(content, node);
+                    let id = declaration_id(file_path, scope, &owned, node.start_byte());
+                    symbols.push(Symbol {
+                        id: id.clone(),
+                        name: owned.clone(),
+                        qualified_name: qualified_name(file_path, scope, &owned),
+                        kind,
+                        file_path: file_path.to_string(),
+                        start_line: line,
+                        end_line: node.end_position().row + 1,
+                        signature: Some(first_line(body).to_string()),
+                        doc_comment: extract_doc_comment(content, node, false),
+                        fingerprint: fingerprint(body),
+                    });
+                    declared_name = Some(owned.clone());
+                    declared_id = Some(id.clone());
+                    action = WalkAction::EnterSymbol { name: owned, id };
+                }
+            }
+        }
+
+        if let Some(name) = declared_name.as_deref() {
+            active_name = Some(name);
+            active_id = declared_id.as_deref();
+        }
+
+        if node.kind() == "call_expression" {
+            if let Some(name) = call_name(content, node) {
+                if !is_noise(name) {
+                    let line = node.start_position().row + 1;
+                    let kind = if name == "test" || name == "group" {
+                        ReferenceKind::Tests
+                    } else {
+                        ReferenceKind::Calls
+                    };
+                    references.push(SymbolReference {
+                        source_file: file_path.to_string(),
+                        source_symbol_name: active_name.map(str::to_string),
+                        source_symbol_id: active_id.map(str::to_string),
+                        target_name: name.to_string(),
+                        target_symbol_id: None,
+                        kind,
+                        line_number: line,
+                    });
+                    if name == "test" || name == "group" {
+                        if let Some(label) = first_quoted(node_text(content, node)) {
+                            let key = (scope.to_vec(), label.to_string(), line);
+                            if seen_tests.insert(key) {
+                                symbols.push(Symbol {
+                                    id: declaration_id(file_path, scope, label, node.start_byte()),
+                                    name: label.to_string(),
+                                    qualified_name: qualified_name(file_path, scope, label),
+                                    kind: SymbolKind::Function,
+                                    file_path: file_path.to_string(),
+                                    start_line: line,
+                                    end_line: line,
+                                    signature: Some(format!("{name}('{label}')")),
+                                    doc_comment: extract_doc_comment(content, node, false),
+                                    fingerprint: fingerprint(label),
+                                });
+                            }
                         }
                     }
                 }
             }
         }
-    }
 
-    if is_import(node.kind()) {
-        let text = node_text(content, node).trim();
-        if !text.is_empty() {
-            references.push(SymbolReference {
-                source_file: file_path.to_string(),
-                source_symbol_name: next.clone(),
-                target_name: text.to_string(),
-                target_symbol_id: None,
-                kind: ReferenceKind::Imports,
-                line_number: node.start_position().row + 1,
-            });
+        if is_import(node.kind()) {
+            let text = node_text(content, node).trim();
+            if !text.is_empty() {
+                references.push(SymbolReference {
+                    source_file: file_path.to_string(),
+                    source_symbol_name: active_name.map(str::to_string),
+                    source_symbol_id: active_id.map(str::to_string),
+                    target_name: text.to_string(),
+                    target_symbol_id: None,
+                    kind: ReferenceKind::Imports,
+                    line_number: node.start_position().row + 1,
+                });
+            }
         }
-    }
 
-    let saved = next;
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk(
-            file_path,
-            content,
-            child,
-            symbols,
-            references,
-            saved.as_deref(),
-        );
-    }
+        action
+    });
 }
 
 fn symbol_kind(kind: &str) -> Option<SymbolKind> {

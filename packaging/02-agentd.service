@@ -1,6 +1,6 @@
 [Unit]
 Description=02 Agent Runtime Daemon (Repository Intelligence & MCP Service)
-Documentation=https://github.com/csy20/02_OS
+Documentation=https://github.com/02-OS/agent-runtime
 # GDM 50 creates a transient greeter account with no writable user home.
 # The repository daemon belongs to signed-in users, not the login screen.
 ConditionUser=!@system
@@ -9,16 +9,19 @@ ConditionUser=!gdm-greeter
 [Service]
 Type=simple
 ExecCondition=/usr/bin/sh -c 'case "$$1" in gdm|gdm-greeter|gdm-greeter-*) exit 1 ;; *) exit 0 ;; esac' sh %u
+# '+' skips ProtectSystem so the directories exist before the sandbox.
+ExecStartPre=+/usr/lib/02-agent/prepare-storage.sh
 ExecStart=/usr/bin/02-agentd
 Restart=on-failure
 RestartSec=3s
 Environment=RUST_LOG=info
 
-# State directories may not exist on first start, and repositories may live
-# outside home. Keep user-writable paths writable while protecting OS files
-# wherever the user manager supports filesystem namespaces.
-ProtectSystem=full
+# strict makes the whole tree read-only, including $HOME. ProtectHome=no
+# only keeps home visible. %h is writable so repositories can be indexed.
+# A user generator adds ReadWritePaths for non-default XDG locations.
+ProtectSystem=strict
 ProtectHome=no
+ReadWritePaths=%h/.local/share/02-agent %h/.cache/02-agent %h/.config/02-agent %t %h
 NoNewPrivileges=true
 
 [Install]

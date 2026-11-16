@@ -1,4 +1,6 @@
-use agent_core::{paths::StoragePaths, types::LiveEnvironmentInfo, Result};
+use agent_core::{
+    contain::write_private_atomic, paths::StoragePaths, types::LiveEnvironmentInfo, Result,
+};
 use agent_git::{GitDiscovery, GitRepo};
 use agent_index::IndexDatabase;
 use serde_json::json;
@@ -22,10 +24,10 @@ pub fn execute(json_output: bool) -> Result<()> {
 
     // 3. Storage path check
     let data_dir = StoragePaths::data_dir()?;
-    let storage_writable = match fs::create_dir_all(&data_dir) {
+    let storage_writable = match StoragePaths::ensure_private_dir(&data_dir) {
         Ok(_) => {
-            let test_file = data_dir.join(".doctor_write_test");
-            if fs::write(&test_file, b"ok").is_ok() {
+            let test_file = data_dir.join(format!(".doctor_write_test.{}", std::process::id()));
+            if write_private_atomic(&test_file, b"ok").is_ok() {
                 let _ = fs::remove_file(test_file);
                 true
             } else {
@@ -37,6 +39,7 @@ pub fn execute(json_output: bool) -> Result<()> {
 
     // 4. Live ISO check
     let live_env = LiveEnvironmentInfo::detect();
+    let daemon_available = crate::commands::watch::daemon_available();
 
     // 5. Current repository check
     let current_dir = env::current_dir()?;
@@ -50,6 +53,10 @@ pub fn execute(json_output: bool) -> Result<()> {
             Some((info, initialized, db_path))
         });
 
+    let watching = repo_check
+        .as_ref()
+        .map(|(info, _, _)| crate::commands::watch::watching(&info.root_path))
+        .transpose()?;
     if json_output {
         let out = json!({
             "is_root": is_root,
@@ -58,6 +65,8 @@ pub fn execute(json_output: bool) -> Result<()> {
             "storage_writable": storage_writable,
             "live_environment": live_env,
             "in_repository": repo_check.is_some(),
+            "watching": watching,
+            "daemon_available": daemon_available,
             "repository": repo_check.map(|(info, init, db)| json!({
                 "id": info.id.as_str(),
                 "name": info.name,
@@ -89,20 +98,22 @@ pub fn execute(json_output: bool) -> Result<()> {
                 "No [FAILED]"
             }
         );
-        println!(
-            "  • Distribution:     {}",
-            if live_env.is_live {
-                "02_OS Live ISO"
-            } else {
-                "02_OS Installed System"
-            }
-        );
+        println!("  • Distribution:     {}", live_env.distribution_label());
         if live_env.is_live {
             println!("    [Notice]          {}", live_env.details);
         }
 
         println!();
         println!("Repository Context:");
+        println!(
+            "  • Background Watch: {:?}; daemon {}",
+            watching,
+            if daemon_available {
+                "available"
+            } else {
+                "stopped"
+            }
+        );
         if let Some((info, initialized, db_path)) = repo_check {
             println!("  • Detected Repo:    {}", info.name);
             println!("  • Path:             {}", info.root_path.display());

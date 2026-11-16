@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --locked --workspace
+      - name: Verify packaging scripts and systemd sandbox configuration
+        run: |
+          bash -n packaging/prepare-storage.sh packaging/02-agent-storage benchmarks/benchmark.sh
+          grep -q '^ProtectSystem=strict$' packaging/02-agentd.service
+          grep -q '^ProtectHome=no$' packaging/02-agentd.service
+          grep -q '^ExecStartPre=+/usr/lib/02-agent/prepare-storage.sh$' packaging/02-agentd.service
+          grep -q '^ReadWritePaths=%h/.local/share/02-agent %h/.cache/02-agent %h/.config/02-agent %t %h$' packaging/02-agentd.service
+          grep -q '^NoNewPrivileges=true$' packaging/02-agentd.service
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+          HOME="$tmpdir/home" XDG_DATA_HOME="$tmpdir/xdg/data" XDG_CACHE_HOME="$tmpdir/xdg/cache" XDG_CONFIG_HOME="$tmpdir/xdg/config" ./packaging/prepare-storage.sh
+          test "$(stat -c '%a' "$tmpdir/xdg/data/02-agent")" = "700"
+          test "$(stat -c '%a' "$tmpdir/xdg/cache/02-agent")" = "700"
+          test "$(stat -c '%a' "$tmpdir/xdg/config/02-agent")" = "700"
+          HOME="$tmpdir/home" XDG_DATA_HOME="$tmpdir/xdg/data" XDG_CACHE_HOME="$tmpdir/xdg/cache" XDG_CONFIG_HOME="$tmpdir/xdg/config" ./packaging/02-agent-storage "$tmpdir/gen"
+          test -f "$tmpdir/gen/02-agentd.service.d/10-xdg-storage.conf"
+          grep -q "ReadWritePaths=\"$tmpdir/xdg/data/02-agent\"" "$tmpdir/gen/02-agentd.service.d/10-xdg-storage.conf"

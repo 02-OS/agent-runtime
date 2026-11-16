@@ -1,0 +1,66 @@
+#!/bin/sh
+# User generator: drop-in ReadWritePaths for the resolved 02-agent
+# data, cache, and config directories. Writes unit files only.
+# Arguments follow systemd.generator(7): normal-dir [early-dir] [late-dir].
+set -eu
+
+out="${1:-}"
+if [ -z "$out" ]; then
+  exit 0
+fi
+
+resolve() {
+  xdg="$1"
+  fallback="$2"
+  if [ -n "$xdg" ]; then
+    printf '%s/02-agent' "${xdg%/}"
+  elif [ -n "${HOME:-}" ]; then
+    printf '%s/%s/02-agent' "$HOME" "$fallback"
+  fi
+}
+
+lines=""
+# ReadWritePaths unquotes arguments and expands % specifiers. It does not decode
+# C hex escapes. Preserve literal bytes, escaping quotes/backslashes and %.
+quote_path() {
+  printf '"'
+  printf '%s' "$1" | LC_ALL=C awk '
+    NR > 1 {
+      print "02-agent-storage: a storage path contains a newline" > "/dev/stderr";
+      exit 1;
+    }
+    { for (i = 1; i <= length($0); i++) {
+        byte = substr($0, i, 1);
+        if (byte == "\\") printf "\\\\";
+        else if (byte == "\"") printf "\\\"";
+        else if (byte == "%") printf "%%%%";
+        else printf "%s", byte;
+      }
+    }' || return 1
+  printf '"'
+}
+
+add_path() {
+  case "$1" in
+    /*)
+      quoted_path=$(quote_path "$1") || exit 1
+      lines="${lines}ReadWritePaths=$quoted_path
+"
+      ;;
+  esac
+}
+
+add_path "$(resolve "${XDG_DATA_HOME:-}" ".local/share")"
+add_path "$(resolve "${XDG_CACHE_HOME:-}" ".cache")"
+add_path "$(resolve "${XDG_CONFIG_HOME:-}" ".config")"
+lines="${lines}ReadWritePaths=%t
+"
+
+dir="$out/02-agentd.service.d"
+mkdir -p -- "$dir"
+tmp="$dir/.10-xdg-storage.conf.tmp"
+cat > "$tmp" <<EOF
+[Service]
+$lines
+EOF
+mv -- "$tmp" "$dir/10-xdg-storage.conf"
