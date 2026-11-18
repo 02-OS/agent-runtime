@@ -27,6 +27,12 @@ enum Commands {
     #[command(about = "Show repository indexing status, Git HEAD, and health")]
     Status,
 
+    #[command(about = "Enable background indexing for the current repository")]
+    Watch,
+
+    #[command(about = "Disable background indexing until explicitly re-enabled")]
+    Unwatch,
+
     #[command(about = "Scan repository files and update the local SQLite FTS5 index")]
     Index {
         #[arg(long, help = "Force a complete re-index of the entire repository")]
@@ -143,6 +149,21 @@ enum Commands {
 
     #[command(about = "Garbage collect orphaned or stale repository indexes")]
     Gc,
+
+    #[command(about = "Serve a loopback page of agents, token counts, approvals, and evidence")]
+    Dashboard,
+
+    #[command(about = "Inspect recorded and pending tool approvals (Phase 6)")]
+    Approval,
+
+    #[command(about = "List compiled and verified evidence package digests (Phase 6)")]
+    Evidence,
+
+    #[command(about = "List or verify local agent skills and tool allowlists (Phase 6)")]
+    Skill {
+        #[command(subcommand)]
+        sub: SkillCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -170,12 +191,25 @@ enum MemoryCommands {
     Verify { id: String },
 }
 
+#[derive(Subcommand, Debug)]
+enum SkillCommands {
+    #[command(about = "List discovered skills in the repository")]
+    List,
+    #[command(about = "Verify a skill directory and its tool allowlist")]
+    Verify {
+        #[arg(help = "Path to the skill directory (default: current directory)")]
+        path: Option<std::path::PathBuf>,
+    },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let result = match cli.command {
         Commands::Init => commands::init::execute(cli.json),
         Commands::Status => commands::status::execute(cli.json),
+        Commands::Watch => commands::watch::execute(true, cli.json),
+        Commands::Unwatch => commands::watch::execute(false, cli.json),
         Commands::Index { full } => commands::index::execute(full, cli.json),
         Commands::Add {
             source,
@@ -207,13 +241,26 @@ fn main() -> ExitCode {
         Commands::Connect { agent, write } => commands::connect::execute(&agent, write),
         Commands::Serve => commands::serve::execute(),
         Commands::Gc => commands::gc::execute(cli.json),
+        Commands::Dashboard => commands::dashboard::execute(),
+        Commands::Approval => commands::telemetry::execute_approvals(cli.json),
+        Commands::Evidence => commands::telemetry::execute_evidence(cli.json),
+        Commands::Skill { sub } => match sub {
+            SkillCommands::List => commands::telemetry::execute_skill_list(cli.json),
+            SkillCommands::Verify { path } => {
+                commands::telemetry::execute_skill_verify(path.as_deref(), cli.json)
+            }
+        },
     };
 
     match result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Error: {}", e);
-            ExitCode::FAILURE
+            if e.to_string().contains("unsupported connect target") {
+                ExitCode::from(2)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }

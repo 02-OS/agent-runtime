@@ -1,4 +1,4 @@
-use agent_core::Result;
+use agent_core::{contain::write_private_atomic, AgentError, Result};
 use agent_git::GitDiscovery;
 use agent_index::GraphExportFormat;
 use agent_memory::{export_graph, RepoHandle};
@@ -20,12 +20,13 @@ pub fn execute_export(
     let document = export_graph(&handle, dataset.as_deref(), parsed)?;
 
     if let Some(path) = output {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(AgentError::Security(format!(
+                "refusing to write graph export through symlink {}",
+                path.display()
+            )));
         }
-        fs::write(&path, &document)?;
+        write_private_atomic(&path, document.as_bytes())?;
         if json_output {
             println!(
                 "{}",

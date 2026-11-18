@@ -37,7 +37,8 @@ impl GitRepo {
         let root = repo
             .workdir()
             .ok_or_else(|| AgentError::Git("Bare repository not supported".into()))?
-            .to_path_buf();
+            .canonicalize()
+            .map_err(|e| AgentError::Git(format!("Failed to resolve worktree root: {e}")))?;
         Ok(Self { repo, root })
     }
 
@@ -223,6 +224,76 @@ impl GitRepo {
         }
     }
 
+    /// Map relative tracked stage-0 paths to their Git blob OID strings in one index open.
+    pub fn list_blob_ids(&self) -> Result<std::collections::HashMap<String, String>> {
+        let index = self
+            .repo
+            .index()
+            .map_err(|e| AgentError::Git(format!("Failed to get index: {}", e)))?;
+        let mut blobs = std::collections::HashMap::with_capacity(index.len());
+        for entry in index.iter() {
+            if ((entry.flags >> 12) & 0x3) != 0 {
+                continue;
+            }
+            if let Ok(path) = std::str::from_utf8(&entry.path) {
+                blobs.insert(path.to_string(), entry.id.to_string());
+            }
+        }
+        Ok(blobs)
+    }
+
+    /// Read a regular UTF-8 evidence blob at an exact commit, with a size cap.
+    pub fn read_text_at_commit(
+        &self,
+        commit_id: &str,
+        relative_path: &str,
+        max_bytes: u64,
+    ) -> Result<String> {
+        use agent_core::{contain::reject_escaping_relative, SecretPattern};
+        let path = Path::new(relative_path);
+        reject_escaping_relative(path)?;
+        if SecretPattern::is_secret(path) {
+            return Err(AgentError::Security(
+                "secret filename is not evidence".into(),
+            ));
+        }
+        let oid = git2::Oid::from_str(commit_id)
+            .map_err(|e| AgentError::Git(format!("Invalid evidence commit: {e}")))?;
+        let commit = self
+            .repo
+            .find_commit(oid)
+            .map_err(|e| AgentError::Git(format!("Evidence commit unavailable: {e}")))?;
+        let tree = commit
+            .tree()
+            .map_err(|e| AgentError::Git(format!("Evidence tree unavailable: {e}")))?;
+        let entry = tree
+            .get_path(path)
+            .map_err(|e| AgentError::Git(format!("Evidence path unavailable at commit: {e}")))?;
+        if !matches!(entry.filemode(), 0o100644 | 0o100755) {
+            return Err(AgentError::Security(
+                "evidence blob is not a regular file".into(),
+            ));
+        }
+        let odb = self
+            .repo
+            .odb()
+            .map_err(|e| AgentError::Git(format!("Evidence object database unavailable: {e}")))?;
+        let (size, kind) = odb
+            .read_header(entry.id())
+            .map_err(|e| AgentError::Git(format!("Evidence blob header unavailable: {e}")))?;
+        if kind != git2::ObjectType::Blob || size as u64 > max_bytes {
+            return Err(AgentError::Security(
+                "evidence blob exceeds the configured size limit".into(),
+            ));
+        }
+        let blob = self
+            .repo
+            .find_blob(entry.id())
+            .map_err(|e| AgentError::Git(format!("Evidence blob unavailable: {e}")))?;
+        String::from_utf8(blob.content().to_vec())
+            .map_err(|_| AgentError::Security("evidence blob is not valid UTF-8".into()))
+    }
+
     /// Retrieve the recent commit log.
     pub fn get_recent_commits(&self, limit: usize) -> Result<Vec<GitCommitInfo>> {
         let mut revwalk = match self.repo.revwalk() {
@@ -241,23 +312,7 @@ impl GitRepo {
                 Err(_) => continue,
             };
             if let Ok(commit) = self.repo.find_commit(oid) {
-                let summary = commit.summary().unwrap_or("").to_string();
-                let author = commit.author().name().unwrap_or("Unknown").to_string();
-                let timestamp = commit.time().seconds();
-                let hex = oid.to_string();
-                let short_id = if hex.len() >= 7 {
-                    hex[..7].to_string()
-                } else {
-                    hex.clone()
-                };
-
-                commits.push(GitCommitInfo {
-                    id: hex,
-                    short_id,
-                    summary,
-                    author,
-                    timestamp,
-                });
+                commits.push(commit_to_info(&commit));
             }
         }
 
@@ -369,6 +424,96 @@ impl GitRepo {
             }
         }
         Ok(paths)
+    }
+
+    /// Local branch short names, sorted.
+    pub fn list_local_branches(&self) -> Result<Vec<String>> {
+        let branches = self
+            .repo
+            .branches(Some(git2::BranchType::Local))
+            .map_err(|err| AgentError::Git(format!("branch list failed: {err}")))?;
+        let mut names = Vec::new();
+        for branch in branches {
+            let (branch, _) =
+                branch.map_err(|err| AgentError::Git(format!("branch entry failed: {err}")))?;
+            if let Some(name) = branch.name().ok().flatten() {
+                names.push(name.to_string());
+            }
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// Summary of one commit. The caller redacts author and summary before display.
+    pub fn commit_info(&self, commit_id: &str) -> Result<GitCommitInfo> {
+        let oid = git2::Oid::from_str(commit_id)
+            .map_err(|err| AgentError::Git(format!("Invalid commit id: {err}")))?;
+        let commit = self
+            .repo
+            .find_commit(oid)
+            .map_err(|err| AgentError::Git(format!("Commit not found: {err}")))?;
+        Ok(commit_to_info(&commit))
+    }
+
+    /// Recent commits whose tree entry for `relative_path` differs from their first parent.
+    pub fn commits_touching(
+        &self,
+        relative_path: &str,
+        limit: usize,
+    ) -> Result<Vec<GitCommitInfo>> {
+        if limit == 0 || relative_path.is_empty() {
+            return Ok(Vec::new());
+        }
+        let target = Path::new(relative_path);
+        let mut revwalk = match self.repo.revwalk() {
+            Ok(r) => r,
+            Err(_) => return Ok(Vec::new()),
+        };
+        if revwalk.push_head().is_err() {
+            return Ok(Vec::new());
+        }
+
+        let mut matched = Vec::new();
+        for id in revwalk.take(200) {
+            if matched.len() >= limit {
+                break;
+            }
+            let Ok(oid) = id else {
+                continue;
+            };
+            let Ok(commit) = self.repo.find_commit(oid) else {
+                continue;
+            };
+            let Ok(tree) = commit.tree() else {
+                continue;
+            };
+            let cur_entry = tree.get_path(target).ok().map(|e| (e.id(), e.filemode()));
+            let old_entry = commit
+                .parent(0)
+                .ok()
+                .and_then(|parent| parent.tree().ok())
+                .and_then(|ptree| ptree.get_path(target).ok().map(|e| (e.id(), e.filemode())));
+            if cur_entry != old_entry {
+                matched.push(commit_to_info(&commit));
+            }
+        }
+        Ok(matched)
+    }
+}
+
+fn commit_to_info(commit: &git2::Commit<'_>) -> GitCommitInfo {
+    let hex = commit.id().to_string();
+    let short_id = hex.chars().take(7).collect();
+    let summary = commit.summary().unwrap_or("").to_string();
+    let author = commit.author().name().unwrap_or("Unknown").to_string();
+    let timestamp = commit.time().seconds();
+    GitCommitInfo {
+        id: hex,
+        short_id,
+        summary,
+        author,
+        timestamp,
     }
 }
 

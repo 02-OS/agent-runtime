@@ -1,4 +1,4 @@
-use agent_context::ContextCompiler;
+use agent_context::{estimate_tokens, ContextCompiler};
 use agent_core::{
     config::RepoConfig,
     types::{EvidenceItem, EvidenceMemory, MemoryKind, MemoryStatus, RepoId, RepoInfo},
@@ -107,6 +107,11 @@ fn test_context_compiler_full_pipeline() {
     }
     db.save_symbols_and_references(&repo_id, &symbols, &references)
         .unwrap();
+    db.complete_index(
+        &repo_info,
+        &RepoScanner::scan_fingerprint(&scanned, &RepoConfig::default()),
+    )
+    .unwrap();
 
     // 4. Save evidence memory
     let store = MemoryStore::for_repo(&repo_id).unwrap();
@@ -242,22 +247,9 @@ fn test_context_budget_ignores_files_past_the_return_cap() {
     assert!(package.relevant_files.len() <= 15);
     assert_eq!(package.budget.returned_files, package.relevant_files.len());
 
-    let snippet_tokens: usize = package
-        .relevant_files
-        .iter()
-        .map(|file| {
-            file.snippet
-                .as_deref()
-                .map(|text| text.len().div_ceil(4))
-                .unwrap_or(0)
-        })
-        .sum();
-    assert!(
-        package.budget.returned_tokens <= snippet_tokens + 2000,
-        "returned_tokens {} charged more than retained snippets {}",
-        package.budget.returned_tokens,
-        snippet_tokens
-    );
+    let payload = package.serialized_payload();
+    assert!(estimate_tokens(&payload) <= 100_000);
+    assert_eq!(package.budget.returned_tokens, estimate_tokens(&payload));
 }
 
 #[test]
@@ -341,13 +333,8 @@ fn context_redacts_secrets_and_obeys_a_tight_budget() {
         })
         .unwrap();
 
-    let empty = ContextCompiler::compile(root, "leaky", 0).unwrap();
-    assert_eq!(empty.budget.returned_tokens, 0);
-    assert!(empty
-        .relevant_files
-        .iter()
-        .all(|file| file.snippet.is_none()));
-    assert!(empty.to_markdown().is_empty());
+    let error = ContextCompiler::compile(root, "leaky", 0).unwrap_err();
+    assert!(error.to_string().contains("Context metadata requires"));
 
     let package = ContextCompiler::compile(root, "leaky", 200).unwrap();
     assert!(package.budget.returned_tokens <= 200);
@@ -372,4 +359,260 @@ fn context_redacts_secrets_and_obeys_a_tight_budget() {
         .any(|memory| memory.id == "mem_invalid"));
     assert!(wide.to_markdown().contains("not verified"));
     assert!(!wide.to_markdown().contains(&token));
+}
+
+#[test]
+fn context_redacts_commit_summaries() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = Repository::init(root).unwrap();
+    let sig = git2::Signature::now("Engineer", "dev@02os.org").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn rotate_refresh_token() {}\n",
+    )
+    .unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("src/lib.rs")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let token = format!("ghp_{}", "x".repeat(36));
+    repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        &format!("rotate {token} now"),
+        &tree,
+        &[],
+    )
+    .unwrap();
+
+    let repo_id = RepoId::from_path(root);
+    let mut db =
+        IndexDatabase::open(agent_core::paths::StoragePaths::repo_db_path(&repo_id).unwrap())
+            .unwrap();
+    db.update_repo_info(&RepoInfo {
+        id: repo_id,
+        name: "history".into(),
+        root_path: root.to_path_buf(),
+        head_commit: Some("abc".into()),
+        branch: Some("master".into()),
+        is_clean: true,
+        modified_count: 0,
+        untracked_count: 0,
+    })
+    .unwrap();
+
+    let package = ContextCompiler::compile(root, "rotate", 8000).unwrap();
+    assert!(!package.git_context.recent_commits.is_empty());
+    assert!(package
+        .git_context
+        .recent_commits
+        .iter()
+        .any(|commit| commit.summary.contains("[REDACTED]")));
+    assert!(package
+        .git_context
+        .recent_commits
+        .iter()
+        .all(|commit| { !commit.summary.contains(&token) && !commit.author.contains(&token) }));
+    let markdown = package.to_markdown();
+    let payload = package.serialized_payload();
+    assert!(!markdown.contains(&token));
+    assert!(markdown.contains("[REDACTED]"));
+    assert!(!payload.contains(&token));
+    assert!(payload.contains("[REDACTED]"));
+    assert!(estimate_tokens(&payload) <= 8000);
+    assert_eq!(package.budget.returned_tokens, estimate_tokens(&payload));
+}
+
+#[test]
+fn secret_named_dirty_file_is_omitted_from_context() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = Repository::init(root).unwrap();
+    let sig = git2::Signature::now("Engineer", "dev@02os.org").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn rotate_refresh_token() {}\n",
+    )
+    .unwrap();
+    let sentinel = "SENTINEL_SECRET_VALUE_92f3";
+    fs::write(
+        root.join("secrets.json"),
+        format!("{{\"token\":\"{sentinel}\"}}\n"),
+    )
+    .unwrap();
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::FORCE, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+        .unwrap();
+
+    let repo_id = RepoId::from_path(root);
+    let mut db =
+        IndexDatabase::open(agent_core::paths::StoragePaths::repo_db_path(&repo_id).unwrap())
+            .unwrap();
+    db.update_repo_info(&RepoInfo {
+        id: repo_id.clone(),
+        name: "secret-context".into(),
+        root_path: root.to_path_buf(),
+        head_commit: Some("abc".into()),
+        branch: Some("master".into()),
+        is_clean: false,
+        modified_count: 1,
+        untracked_count: 0,
+    })
+    .unwrap();
+    let scanned = RepoScanner::new(root, RepoConfig::default()).scan();
+    db.save_scanned_files(&repo_id, &scanned).unwrap();
+    db.complete_index(
+        &RepoInfo {
+            id: repo_id,
+            name: "secret-context".into(),
+            root_path: root.to_path_buf(),
+            head_commit: Some("abc".into()),
+            branch: Some("master".into()),
+            is_clean: false,
+            modified_count: 1,
+            untracked_count: 0,
+        },
+        &RepoScanner::scan_fingerprint(&scanned, &RepoConfig::default()),
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("secrets.json"),
+        format!("{{\"token\":\"{sentinel}-dirty\"}}\n"),
+    )
+    .unwrap();
+
+    let package = ContextCompiler::compile(root, "rotate_refresh_token", 4000).unwrap();
+    let payload = package.serialized_payload();
+    assert!(!payload.contains(sentinel));
+    assert!(!payload.contains("secrets.json"));
+    assert!(package
+        .relevant_files
+        .iter()
+        .all(|file| file.relative_path != "secrets.json"));
+    assert!(!package
+        .git_context
+        .modified_files
+        .iter()
+        .any(|path| path == "secrets.json"));
+    assert!(package
+        .relevant_files
+        .iter()
+        .any(|file| file.relative_path == "src/lib.rs"));
+}
+
+#[test]
+fn compile_deduplicates_exact_matches_and_includes_facts_and_docs() {
+    use agent_memory::{extract::facts_from_symbols, FactStore};
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = Repository::init(root).unwrap();
+    let sig = git2::Signature::now("Engineer", "dev@02os.org").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+
+    fs::write(
+        root.join("src/auth.rs"),
+        "/// Validates an active refresh session.\npub fn validate() -> bool { helper() }\npub fn helper() -> bool { true }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("tests/auth_test.rs"),
+        "#[test]\nfn test_validate() { validate(); }\n",
+    )
+    .unwrap();
+
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::FORCE, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let commit = repo
+        .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    let repo_id = RepoId::from_path(root);
+    let mut db =
+        IndexDatabase::open(agent_core::paths::StoragePaths::repo_db_path(&repo_id).unwrap())
+            .unwrap();
+    let info = RepoInfo {
+        id: repo_id.clone(),
+        name: "dedup".into(),
+        root_path: root.to_path_buf(),
+        head_commit: Some(commit.to_string()),
+        branch: Some("master".into()),
+        is_clean: true,
+        modified_count: 0,
+        untracked_count: 0,
+    };
+    db.update_repo_info(&info).unwrap();
+    let scanned = RepoScanner::new(root, RepoConfig::default()).scan();
+    db.save_scanned_files(&repo_id, &scanned).unwrap();
+    let mut symbols = Vec::new();
+    let mut references = Vec::new();
+    for item in &scanned {
+        if let Some(ref text) = item.content {
+            let ext = agent_parser::CodeExtractor::extract(
+                &item.file.relative_path,
+                text,
+                item.file.language,
+            )
+            .unwrap();
+            symbols.extend(ext.symbols);
+            references.extend(ext.references);
+        }
+    }
+    db.save_symbols_and_references(&repo_id, &symbols, &references)
+        .unwrap();
+    db.complete_index(
+        &info,
+        &RepoScanner::scan_fingerprint(&scanned, &RepoConfig::default()),
+    )
+    .unwrap();
+
+    let fact_store = FactStore::for_repo(&repo_id).unwrap();
+    let facts = facts_from_symbols(repo_id.as_str(), &commit.to_string(), &symbols);
+    fact_store.upsert_batch(&facts).unwrap();
+
+    let package = ContextCompiler::compile(root, "validate", 8000).unwrap();
+    let validate_count = package
+        .relevant_symbols
+        .iter()
+        .filter(|s| s.symbol.name == "validate")
+        .count();
+    assert_eq!(validate_count, 1);
+    let sym = package
+        .relevant_symbols
+        .iter()
+        .find(|s| s.symbol.name == "validate")
+        .unwrap();
+    assert_eq!(
+        sym.symbol.doc_comment.as_deref(),
+        Some("Validates an active refresh session.")
+    );
+    assert_eq!(package.dependencies.len(), 2);
+    assert!(package
+        .dependencies
+        .iter()
+        .any(|d| d.caller == "validate" && d.callee == "helper"));
+    assert!(package
+        .dependencies
+        .iter()
+        .any(|d| d.caller == "test_validate" && d.callee == "validate"));
+    assert_eq!(package.relevant_tests.len(), 1);
+    assert!(!package.relevant_facts.is_empty());
+    let md = package.to_markdown();
+    assert!(md.contains("Validates an active refresh session."));
+    assert!(md.contains("## Anchored Facts"));
 }

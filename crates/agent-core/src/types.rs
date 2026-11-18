@@ -1,8 +1,17 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
+
+/// Truncate `text` to at most `max_chars` Unicode scalar values on a valid UTF-8 boundary.
+pub fn truncate_chars(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    }
+}
 
 /// Deterministic unique identifier for a repository on the local system.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -167,6 +176,33 @@ impl Language {
             Self::Unknown => "unknown",
         }
     }
+
+    /// The tree-sitter extractors cover these languages. Markup and fallback-only
+    /// kinds such as Markdown or SQL do not.
+    pub fn extracts_symbols(self) -> bool {
+        matches!(
+            self,
+            Self::Rust
+                | Self::Python
+                | Self::TypeScript
+                | Self::JavaScript
+                | Self::C
+                | Self::Cpp
+                | Self::Bash
+                | Self::Dart
+                | Self::Go
+        )
+    }
+
+    /// True when `path`'s extension is a language the parser can extract symbols from.
+    /// Matching is case-insensitive via `from_extension`.
+    pub fn path_extracts_symbols(path: &str) -> bool {
+        let extension = Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+        Self::from_extension(extension).extracts_symbols()
+    }
 }
 
 /// Metadata for an indexed file.
@@ -298,6 +334,9 @@ impl ReferenceKind {
 pub struct SymbolReference {
     pub source_file: String,
     pub source_symbol_name: Option<String>,
+    /// Exact declaration identity; absent in catalogs written by older runtimes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_symbol_id: Option<String>,
     pub target_name: String,
     pub target_symbol_id: Option<String>,
     pub kind: ReferenceKind,
@@ -378,6 +417,7 @@ pub struct EvidenceItem {
     pub file: String,
     pub symbols: Vec<String>,
     pub commit: String,
+    /// Legacy symbol hash or a versioned symbols-v1/file-v1 evidence baseline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
 }
@@ -447,29 +487,34 @@ impl SecretPattern {
 
         // Substring matches for credential filenames. Source files such as
         // `secret_rotation.go` stay in the catalog; their bodies are redacted.
-        if !is_source_file_name(&file_name)
+        !is_source_file_name(&file_name)
             && !file_name.ends_with(".md")
             && !file_name.ends_with(".txt")
             && (file_name.contains("secret")
                 || file_name.contains("credential")
                 || file_name.contains("private_key"))
-        {
-            return true;
-        }
+    }
 
-        false
+    /// Replace documented credential patterns with `[REDACTED]` without allocating on clean input.
+    pub fn redact_cow(content: &str) -> Cow<'_, str> {
+        let patterns = compiled_secret_patterns();
+        let matches = patterns.set.matches(content);
+        if !matches.matched_any() {
+            return Cow::Borrowed(content);
+        }
+        let mut redacted = Cow::Borrowed(content);
+        for index in matches.iter() {
+            let (pattern, replacement) = &patterns.rules[index];
+            if let Cow::Owned(replaced) = pattern.replace_all(&redacted, *replacement) {
+                redacted = Cow::Owned(replaced);
+            }
+        }
+        redacted
     }
 
     /// Replace documented credential patterns with `[REDACTED]`.
     pub fn redact(content: &str) -> String {
-        let mut redacted = content.to_string();
-        for pattern in secret_patterns() {
-            let next = pattern.replace_all(&redacted, "[REDACTED]");
-            if next != redacted {
-                redacted = next.into_owned();
-            }
-        }
-        redacted
+        Self::redact_cow(content).into_owned()
     }
 }
 
@@ -483,22 +528,126 @@ fn is_source_file_name(file_name: &str) -> bool {
         .any(|ext| file_name.ends_with(&format!(".{ext}")))
 }
 
-fn secret_patterns() -> &'static [regex::Regex] {
+struct SecretPatterns {
+    set: regex::RegexSet,
+    rules: Vec<(regex::Regex, &'static str)>,
+}
+
+fn compiled_secret_patterns() -> &'static SecretPatterns {
     use std::sync::OnceLock;
-    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    static PATTERNS: OnceLock<SecretPatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| {
-        [
-            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
-            r"\bAKIA[0-9A-Z]{16}\b",
-            r"\bghp_[A-Za-z0-9_]{36}\b",
-            r"\bgithub_pat_[A-Za-z0-9_]{82}\b",
-            r"\bxox[baprs]-[0-9A-Za-z-]{10,48}",
-            r#"(?i)(api[_-]?key|secret|token)\s*[:=]\s*["'][A-Za-z0-9_\-]{20,}["']"#,
-        ]
-        .into_iter()
-        .map(|pattern| regex::Regex::new(pattern).expect("secret pattern"))
-        .collect()
+        let specs: [(&str, &str); 9] = [
+            (
+                r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+                "[REDACTED]",
+            ),
+            (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "[REDACTED]"),
+            // Named AWS secret access keys only. A bare 40-character hex blob stays visible.
+            (
+                r#"(?i)aws_secret_access_key\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}"#,
+                "[REDACTED]",
+            ),
+            (r"\bgh[pousr]_[A-Za-z0-9_]{36,255}\b", "[REDACTED]"),
+            (r"\bgithub_pat_[A-Za-z0-9_]{22,255}\b", "[REDACTED]"),
+            (r"\bxox[baprs]-[0-9A-Za-z-]{10,48}", "[REDACTED]"),
+            (
+                r"(?i)(Authorization\s*:\s*(?:Bearer|Basic)\s+)[A-Za-z0-9._~+/=-]{8,}",
+                "${1}[REDACTED]",
+            ),
+            (
+                r#"([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s/:@"'<>]+:[^\s/@"'<>]+@"#,
+                "${1}[REDACTED]@",
+            ),
+            (
+                r#"(?i)["']?(?:api[_-]?key|secret|token|password|passwd|auth)["']?\s*[:=]\s*["'][A-Za-z0-9_.+/=-]{12,}["']"#,
+                "[REDACTED]",
+            ),
+        ];
+        let set = regex::RegexSet::new(specs.iter().map(|(pattern, _)| *pattern))
+            .expect("secret pattern set");
+        let rules = specs
+            .into_iter()
+            .map(|(pattern, replacement)| {
+                (regex::Regex::new(pattern).expect("secret pattern"), replacement)
+            })
+            .collect();
+        SecretPatterns { set, rules }
     })
+}
+
+/// How this machine relates to 02_OS. The account name `live` is not an input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKind {
+    /// `/run/archiso/bootmnt` or `/run/archiso/airootfs` is present.
+    Live,
+    /// Not a live image, and os-release `NAME` is `02_OS`.
+    Installed,
+    /// Neither live markers nor an installed 02_OS identity.
+    Unidentified,
+}
+
+impl HostKind {
+    /// Classify from live-image markers and the text of an os-release file.
+    pub fn classify(live_markers: bool, os_release: &str) -> Self {
+        if live_markers {
+            return Self::Live;
+        }
+        if os_release_names_product(os_release) {
+            Self::Installed
+        } else {
+            Self::Unidentified
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Live => "02_OS Live ISO",
+            Self::Installed => "02_OS Installed System",
+            Self::Unidentified => "Unidentified host",
+        }
+    }
+}
+
+fn os_release_field<'a>(text: &'a str, target_key: &str) -> Option<&'a str> {
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != target_key {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|rest| rest.strip_suffix('\''))
+            })
+            .unwrap_or(value)
+            .trim();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn os_release_names_product(text: &str) -> bool {
+    os_release_field(text, "NAME") == Some("02_OS")
+}
+
+fn os_release_display_name(text: &str) -> Option<String> {
+    os_release_field(text, "PRETTY_NAME")
+        .or_else(|| os_release_field(text, "NAME"))
+        .map(ToOwned::to_owned)
 }
 
 /// Live ISO runtime detection.
@@ -506,6 +655,7 @@ fn secret_patterns() -> &'static [regex::Regex] {
 pub struct LiveEnvironmentInfo {
     pub is_live: bool,
     pub live_overlay_detected: bool,
+    pub host_kind: HostKind,
     pub details: String,
 }
 
@@ -516,17 +666,51 @@ impl LiveEnvironmentInfo {
         // The account name `live` is not evidence of the live image. sudo keeps
         // the caller's USER, and an installed account can also be named live.
         let is_live = has_bootmnt || has_archiso_airootfs;
+        let os_release = read_os_release();
+        let host_kind = HostKind::classify(is_live, &os_release);
 
-        let details = if is_live {
-            "Running inside 02_OS Live ISO session. Repository indices created in home directory are stored in volatile RAM overlayfs unless mounted from persistent media.".to_string()
-        } else {
-            "Running on installed 02_OS system with persistent storage.".to_string()
+        let details = match host_kind {
+            HostKind::Live => "Running inside 02_OS Live ISO session. Repository indices created in home directory are stored in volatile RAM overlayfs unless mounted from persistent media.".to_string(),
+            HostKind::Installed => {
+                "Running on installed 02_OS system with persistent storage.".to_string()
+            }
+            HostKind::Unidentified => match os_release_display_name(&os_release) {
+                Some(distro) => format!(
+                    "Running on {distro} host with persistent storage (os-release NAME is not 02_OS)."
+                ),
+                None => {
+                    "Host is not the 02_OS live image and os-release NAME is not 02_OS.".to_string()
+                }
+            },
         };
 
         Self {
             is_live,
             live_overlay_detected: has_bootmnt || has_archiso_airootfs,
+            host_kind,
             details,
         }
     }
+
+    pub fn distribution_label(&self) -> String {
+        match self.host_kind {
+            HostKind::Live | HostKind::Installed => self.host_kind.label().to_string(),
+            HostKind::Unidentified => {
+                let os_release = read_os_release();
+                match os_release_display_name(&os_release) {
+                    Some(distro) => format!("{distro} (Persistent Host Storage)"),
+                    None => self.host_kind.label().to_string(),
+                }
+            }
+        }
+    }
+}
+
+fn read_os_release() -> String {
+    for path in ["/etc/os-release", "/usr/lib/os-release"] {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            return text;
+        }
+    }
+    String::new()
 }

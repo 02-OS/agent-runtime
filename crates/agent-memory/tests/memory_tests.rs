@@ -1,4 +1,4 @@
-use agent_core::types::{EvidenceItem, EvidenceMemory, MemoryKind, MemoryStatus, RepoId};
+use agent_core::types::{EvidenceItem, EvidenceMemory, MemoryKind, MemoryStatus, RepoId, RepoInfo};
 use agent_index::IndexDatabase;
 use agent_memory::{MemoryStore, MemoryVerifier};
 use chrono::Utc;
@@ -30,13 +30,24 @@ fn test_memory_store_crud() {
 
     store.save(&mem).unwrap();
 
+    let mut newer = mem.clone();
+    newer.claim = "A later writer stored this claim".to_string();
+    newer.updated_at = Utc::now();
+    store.save(&newer).unwrap();
+    let refused = store.save_if_unchanged(&mem, mem.updated_at).unwrap_err();
+    assert!(refused.to_string().contains("stale memory write"));
+    assert_eq!(
+        store.get("mem_auth_17").unwrap().unwrap().claim,
+        "A later writer stored this claim"
+    );
+
     let all = store.load_all().unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].id, "mem_auth_17");
 
     let found = store.get("mem_auth_17").unwrap();
     assert!(found.is_some());
-    assert_eq!(found.unwrap().claim, mem.claim);
+    assert_eq!(found.unwrap().claim, "A later writer stored this claim");
 
     let deleted = store.delete("mem_auth_17").unwrap();
     assert!(deleted);
@@ -135,4 +146,134 @@ fn test_concurrent_saves_keep_every_row() {
     let mut expected: Vec<_> = (0..32).map(|index| format!("id-{index}")).collect();
     expected.sort();
     assert_eq!(ids, expected);
+}
+
+#[test]
+fn memory_store_redacts_new_and_legacy_claims_without_changing_evidence() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("memories.jsonl");
+    let store = MemoryStore::new(path.clone());
+    let token = format!("ghp_{}", "a".repeat(36));
+    let memory = EvidenceMemory {
+        id: "keep-id".into(),
+        claim: format!("auditprobe uses {token}"),
+        kind: MemoryKind::SecurityConstraint,
+        evidence: vec![EvidenceItem {
+            file: "src/auth.rs".into(),
+            symbols: vec!["authenticate".into()],
+            commit: "abc".into(),
+            fingerprint: Some("recorded-fingerprint".into()),
+        }],
+        valid_at: "abc".into(),
+        confidence: 0.0,
+        status: MemoryStatus::Invalidated,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    // Simulate a store written before the redaction boundary existed.
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&memory).unwrap()),
+    )
+    .unwrap();
+    let loaded = store.get("keep-id").unwrap().unwrap();
+    assert_eq!(loaded.claim, "auditprobe uses [REDACTED]");
+    assert_eq!(loaded.id, memory.id);
+    assert_eq!(loaded.evidence[0].file, memory.evidence[0].file);
+    assert_eq!(
+        loaded.evidence[0].fingerprint,
+        memory.evidence[0].fingerprint
+    );
+    assert_eq!(loaded.status, MemoryStatus::Invalidated);
+    store.save(&memory).unwrap();
+    assert!(!fs::read_to_string(&path).unwrap().contains(&token));
+    assert!(fs::read_to_string(&path).unwrap().contains("[REDACTED]"));
+}
+
+#[test]
+fn seed_names_02_os_and_uses_the_runtime_cargo_path_that_exists() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("profile")).unwrap();
+    fs::write(dir.path().join("profile/profiledef.sh"), "iso_name=02_OS\n").unwrap();
+    fs::create_dir_all(dir.path().join("vendor/agent-runtime")).unwrap();
+    fs::write(
+        dir.path().join("vendor/agent-runtime/Cargo.toml"),
+        "[workspace]\n",
+    )
+    .unwrap();
+
+    let store = MemoryStore::new(dir.path().join("memories.jsonl"));
+    let info = RepoInfo {
+        id: RepoId::from_path(dir.path()),
+        name: "fixture".to_string(),
+        root_path: dir.path().to_path_buf(),
+        head_commit: Some("abc123".to_string()),
+        branch: Some("master".to_string()),
+        is_clean: true,
+        modified_count: 0,
+        untracked_count: 0,
+    };
+    assert_eq!(store.seed_initial_if_empty(&info).unwrap(), 2);
+    let all = store.load_all().unwrap();
+    let profile = all
+        .iter()
+        .find(|memory| memory.id == "mem_archiso_profile")
+        .unwrap();
+    assert_eq!(
+        profile.claim,
+        "02_OS is a live image built with mkarchiso from profile/"
+    );
+    assert!(!profile.claim.contains("Arch Linux"));
+    let runtime = all
+        .iter()
+        .find(|memory| memory.id == "mem_agent_runtime")
+        .unwrap();
+    assert_eq!(runtime.evidence[0].file, "vendor/agent-runtime/Cargo.toml");
+
+    fs::create_dir_all(dir.path().join("components/02-agent")).unwrap();
+    fs::write(
+        dir.path().join("components/02-agent/Cargo.toml"),
+        "[workspace]\n",
+    )
+    .unwrap();
+    let preferred = MemoryStore::new(dir.path().join("other-memories.jsonl"));
+    preferred.seed_initial_if_empty(&info).unwrap();
+    let preferred_runtime = preferred
+        .load_all()
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.id == "mem_agent_runtime")
+        .unwrap();
+    assert_eq!(
+        preferred_runtime.evidence[0].file,
+        "components/02-agent/Cargo.toml"
+    );
+    assert!(preferred_runtime.claim.contains("components/02-agent/"));
+}
+
+#[test]
+fn memory_store_fails_closed_on_malformed_jsonl_and_writes_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("memories.jsonl");
+    fs::write(&path, "{\"not\":\"an evidence memory\"}\n").unwrap();
+    let store = MemoryStore::new(path.clone());
+    assert!(store.load_all().is_err());
+
+    let clean_path = dir.path().join("clean.jsonl");
+    let clean_store = MemoryStore::new(clean_path.clone());
+    let mem = EvidenceMemory {
+        id: "m1".into(),
+        claim: "safe".into(),
+        kind: MemoryKind::ArchitecturalFact,
+        evidence: Vec::new(),
+        valid_at: "abc".into(),
+        confidence: 1.0,
+        status: MemoryStatus::Fresh,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    clean_store.save(&mem).unwrap();
+    let mode = fs::metadata(&clean_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
 }

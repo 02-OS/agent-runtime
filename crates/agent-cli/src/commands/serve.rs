@@ -14,7 +14,7 @@ pub fn execute() -> Result<()> {
         }
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "02-agentd binary not found on PATH or alongside 02agent",
+            "02-agentd binary not found on PATH or alongside 02",
         ))
     })?;
 

@@ -8,7 +8,7 @@ Because coding agents interact with proprietary source code and sensitive reposi
 
 1. **Zero External Data Exfiltration**: The runtime never initiates external network requests, transmits telemetry, or contacts cloud endpoints.
 2. **Zero Provider Lock-In**: The runtime does not handle or store proprietary LLM API keys. It functions strictly as a local repository intelligence engine over standard MCP.
-3. **Secret Isolation**: Sensitive files, private keys, and API tokens are detected and stripped before entering search indices or evidence packages.
+3. **Secret Isolation**: Sensitive files, private keys, and API tokens are detected and stripped before entering search indices, memories, git context, or evidence packages.
 4. **User-Service Sandboxing**: The daemon is a systemd user service. It warns when started as root and keeps running. Storage and the socket stay private to the owning uid.
 5. **Multi-User IPC Isolation**: Inter-process communication occurs over Unix domain sockets restricted exclusively to the owning user (`0600`).
 
@@ -16,18 +16,19 @@ Because coding agents interact with proprietary source code and sensitive reposi
 
 ## 2. Secret Scanning & Exclusion Pipeline
 
-The indexing engine (`agent-index`) skips exact secret filenames (`.env`, key material, `secrets.json`), `.env.*` names, and secret extensions. Source files whose names merely contain words like `secret` stay in the catalog. After a file is decoded as UTF-8, credential matches are replaced with `[REDACTED]` before FTS and file datapoints are written. The content hash still uses the raw bytes, so a later edit is detected.
+The indexing engine (`agent-index`) skips exact secret filenames (`.env`, key material, `secrets.json`), `.env.*` names, non-source files containing `secret`/`credential`/`private_key`, and secret extensions (`.pem`, `.key`, `.p12`, `.pfx`, `.kdbx`, `.keystore`, `.jks`). Source files whose names merely contain words like `secret` (e.g. `secret_rotation.go`) stay in the catalog; their bodies are redacted. After a file is decoded as UTF-8, credential matches are replaced with `[REDACTED]` before FTS, symbols, memories, git diffs/commits, and file datapoints are written or rendered. The content hash still uses the raw bytes, so a later edit is detected.
 
 ### Filtered Patterns
 
 | Category | Detection Regex / Rule | Action |
 | :--- | :--- | :--- |
-| **Private Keys** | `-----BEGIN (RSA\|OPENSSH\|EC\|PGP) PRIVATE KEY-----` | Exclude file / redact content |
-| **AWS Credentials** | `AKIA[0-9A-Z]{16}`, AWS secret access key patterns | Redact match |
-| **GitHub Tokens** | `ghp_[A-Za-z0-9_]{36}`, `github_pat_[A-Za-z0-9_]{82}` | Redact match |
-| **Slack Tokens** | `xox[baprs]-[0-9A-Za-z]{10,48}` | Redact match |
-| **Generic API Keys** | High-entropy strings matching `(api[_-]?key\|secret\|token)\s*[:=]\s*["'][A-Za-z0-9_\-]{20,}["']` | Redact match |
-| **Environment Files** | `.env`, `.env.local`, `.env.*.local` | Excluded from text indexing |
+| **Private Keys** | `-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----` | Exclude file / redact content |
+| **AWS Credentials** | `\b(?:AKIA\|ASIA)[0-9A-Z]{16}\b`, `(?i)aws_secret_access_key\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}` | Redact match |
+| **GitHub Tokens** | `\bgh[pousr]_[A-Za-z0-9_]{36,255}\b`, `\bgithub_pat_[A-Za-z0-9_]{22,255}\b` | Redact match |
+| **Slack Tokens** | `\bxox[baprs]-[0-9A-Za-z-]{10,48}` | Redact match |
+| **Auth Headers & URLs** | `Authorization: (Bearer\|Basic) ...`, `scheme://user:password@host` | Redact credential |
+| **Generic API Keys** | `(?i)["']?(?:api[_-]?key\|secret\|token\|password\|passwd\|auth)["']?\s*[:=]\s*["'][A-Za-z0-9_.+/=-]{12,}["']` | Redact match |
+| **Environment Files** | `.env`, `.env.local`, `.env.*.local` | Excluded from text indexing & diffs |
 
 Developers can audit their repository at any time:
 
@@ -41,7 +42,7 @@ Developers can audit their repository at any time:
 
 ### Non-Root Enforcement
 
-`02-agentd` is a user service. Its systemd unit excludes system accounts and GDM greeters. If the binary is started directly as UID 0 it prints a warning and continues. It does not exit solely because the uid is root. Socket mode `0600`, directory mode `0700`, and `SO_PEERCRED` still limit who can connect.
+`02-agentd` is a user service. Its packaged unit excludes system accounts and GDM greeters. If the binary is started directly as UID 0 it prints a warning and continues. It does not exit solely because the uid is root. Socket mode `0600`, directory mode `0700`, and `SO_PEERCRED` still limit who can connect.
 
 ### Systemd User Sandboxing
 
@@ -55,19 +56,22 @@ ConditionUser=!gdm-greeter
 [Service]
 Type=simple
 ExecCondition=/usr/bin/sh -c 'case "$$1" in gdm|gdm-greeter|gdm-greeter-*) exit 1 ;; *) exit 0 ;; esac' sh %u
+ExecStartPre=+/usr/lib/02-agent/prepare-storage.sh
 ExecStart=/usr/bin/02-agentd
 Restart=on-failure
 RestartSec=3s
 Environment=RUST_LOG=info
 
-ProtectSystem=full
+ProtectSystem=strict
 ProtectHome=no
+ReadWritePaths=%h/.local/share/02-agent %h/.cache/02-agent %h/.config/02-agent %t %h
 NoNewPrivileges=true
 ```
 
-- **`ProtectSystem=full`**: Protects `/usr`, `/boot`, `/efi`, and `/etc` without making user state or arbitrary user-owned project directories read-only. Filesystem namespace protection in a user service depends on kernel and user-manager support; newer systemd releases can enable a user namespace implicitly for these settings.
-- **`ProtectHome=no`**: Keeps home directories accessible. The daemon creates missing state directories and per-repository `.02agent` directories with mode `0700`; ordinary file permissions still control write access.
-- **Account checks**: `ConditionUser=!@system` excludes system UIDs. The execution condition also rejects `gdm`, `gdm-greeter`, and `gdm-greeter-*` usernames, including dynamically numbered greeters. `ConditionUser` itself does not accept username globs.
+- **`ProtectSystem=strict`**: Mounts the whole file system read-only, including `$HOME`. `ProtectHome=no` does not undo that.
+- **`ExecStartPre=+/usr/lib/02-agent/prepare-storage.sh`**: The `+` prefix skips the sandbox and creates the data, cache, and config directories (mode `0700`, replacing any terminal symlink rather than following it) before the daemon starts. Those paths honor `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_CONFIG_HOME`, with the usual defaults under `~/.local/share`, `~/.cache`, and `~/.config`. A missing directory is not papered over with a `-` prefix on `ReadWritePaths`.
+- **`ProtectHome=no` and `ReadWritePaths=%h`**: Home stays visible and writable so repositories there can be indexed. Data, cache, config, and `%t` are listed as well. The `02-agent-storage` systemd user generator (`packaging/02-agent-storage`) emits a `10-xdg-storage.conf` drop-in adding `ReadWritePaths` when those XDG directories sit outside `$HOME`.
+- **Account checks**: The unit filters system UIDs and static/dynamic GDM greeter names. It does not order itself after the target that enables it.
 - **`NoNewPrivileges=true`**: Disallows gaining new privileges via `setuid` binaries.
 
 ---

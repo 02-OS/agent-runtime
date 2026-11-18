@@ -1,3 +1,4 @@
+use crate::contain::{contains_symlink, read_regular_text_within};
 use crate::error::{AgentError, Result};
 use crate::types::RepoId;
 use chrono::{DateTime, Utc};
@@ -233,11 +234,26 @@ impl Default for Ontology {
 
 impl Ontology {
     pub fn load(repo_root: &Path) -> Result<Self> {
-        let path = repo_root.join(".02agent").join("ontology.toml");
-        if !path.is_file() {
-            return Ok(Self::default());
+        let relative = Path::new(".02agent").join("ontology.toml");
+        if contains_symlink(repo_root, &relative) {
+            return Err(AgentError::Security(
+                "refusing to read ontology.toml through a symlink".to_string(),
+            ));
         }
-        let text = fs::read_to_string(&path)?;
+        let path = repo_root.join(&relative);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Ok(_) => {
+                return Err(AgentError::Security(
+                    "ontology.toml exists and is not a regular file".to_string(),
+                ));
+            }
+            Err(err) => return Err(err.into()),
+        }
+        let text = read_regular_text_within(repo_root, &relative, 2048 * 1024)?;
         let parsed: OntologyFile = toml::from_str(&text)?;
         let edge_kinds = match parsed.edge_kinds {
             None => EdgeKind::all().to_vec(),
